@@ -36,7 +36,6 @@ import {
 } from '../../third_party/rxjs/rxjs.js';
 import type {HTTPRequest} from '../api/HTTPRequest.js';
 import type {HTTPResponse} from '../api/HTTPResponse.js';
-import type {BidiNetworkManager} from '../bidi/NetworkManager.js';
 import type {Accessibility} from '../cdp/Accessibility.js';
 import type {Coverage} from '../cdp/Coverage.js';
 import type {DeviceRequestPrompt} from '../cdp/DeviceRequestPrompt.js';
@@ -1688,7 +1687,7 @@ export abstract class Page extends EventEmitter<PageEvents> {
    * @internal
    */
   _waitForNetworkIdle(
-    networkManager: BidiNetworkManager | CdpNetworkManager,
+    networkManager: CdpNetworkManager,
     idleTime: number,
     requestsInFlight = 0
   ): Observable<void> {

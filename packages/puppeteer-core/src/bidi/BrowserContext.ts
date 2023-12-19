@@ -16,16 +16,19 @@
 
 import * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
-import type {WaitForTargetOptions} from '../api/Browser.js';
 import {BrowserContext} from '../api/BrowserContext.js';
-import type {Page} from '../api/Page.js';
+import {PageEvent, type Page} from '../api/Page.js';
 import type {Target} from '../api/Target.js';
 import {UnsupportedOperation} from '../common/Errors.js';
+import {EventSubscription} from '../common/EventEmitter.js';
 import type {Viewport} from '../common/Viewport.js';
+import {Deferred} from '../util/Deferred.js';
+import {DisposableStack} from '../util/disposable.js';
 
 import type {BidiBrowser} from './Browser.js';
+import {BrowsingContext} from './BrowsingContext.js';
 import type {BidiConnection} from './Connection.js';
-import type {BidiPage} from './Page.js';
+import {BidiPage} from './Page.js';
 
 /**
  * @internal
@@ -39,55 +42,64 @@ export interface BidiBrowserContextOptions {
  * @internal
  */
 export class BidiBrowserContext extends BrowserContext {
-  #browser: BidiBrowser;
-  #connection: BidiConnection;
-  #defaultViewport: Viewport | null;
-  #isDefault = false;
+  readonly #browser: BidiBrowser;
+  readonly #defaultViewport: Viewport | null;
+  readonly #isDefault: boolean;
+
+  readonly #disposables = new DisposableStack();
+  readonly #pages = new Map<string, Deferred<BidiPage>>();
 
   constructor(browser: BidiBrowser, options: BidiBrowserContextOptions) {
     super();
     this.#browser = browser;
-    this.#connection = this.#browser.connection;
     this.#defaultViewport = options.defaultViewport;
     this.#isDefault = options.isDefault;
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'browsingContext.contextCreated',
+        (info: Bidi.BrowsingContext.Info) => {
+          if (info.parent) {
+            return;
+          }
+          const page = new BidiPage(
+            BrowsingContext.createTopContext(this, info.context, info.url)
+          );
+          const pageId = page.mainFrame()._id;
+
+          const deferred = this.#pages.get(pageId) ?? new Deferred();
+          deferred.resolve(page);
+          this.#pages.set(pageId, deferred);
+
+          this.#disposables.use(
+            new EventSubscription(page, PageEvent.Close, (_: undefined) => {
+              this.#pages.delete(pageId);
+            })
+          );
+        }
+      )
+    );
   }
 
-  override targets(): Target[] {
-    return this.#browser.targets().filter(target => {
-      return target.browserContext() === this;
-    });
+  get #connection(): BidiConnection {
+    return this.#browser.connection;
   }
 
-  override waitForTarget(
-    predicate: (x: Target) => boolean | Promise<boolean>,
-    options: WaitForTargetOptions = {}
-  ): Promise<Target> {
-    return this.#browser.waitForTarget(target => {
-      return target.browserContext() === this && predicate(target);
-    }, options);
-  }
-
-  get connection(): BidiConnection {
-    return this.#connection;
+  override browser(): BidiBrowser {
+    return this.#browser;
   }
 
   override async newPage(): Promise<Page> {
-    const {result} = await this.#connection.send('browsingContext.create', {
+    const {
+      result: {context},
+    } = await this.#connection.send('browsingContext.create', {
       type: Bidi.BrowsingContext.CreateType.Tab,
     });
-    const target = this.#browser._getTargetById(result.context);
+    const deferred = this.#pages.get(context) ?? new Deferred();
+    this.#pages.set(context, deferred);
 
-    // TODO: once BiDi has some concept matching BrowserContext, the newly
-    // created contexts should get automatically assigned to the right
-    // BrowserContext. For now, we assume that only explicitly created pages go
-    // to the current BrowserContext. Otherwise, the contexts get assigned to
-    // the default BrowserContext by the Browser.
-    target._setBrowserContext(this);
-
-    const page = await target.page();
-    if (!page) {
-      throw new Error('Page is not found');
-    }
+    const page = await deferred.valueOrThrow();
     if (this.#defaultViewport) {
       try {
         await page.setViewport(this.#defaultViewport);
@@ -103,27 +115,31 @@ export class BidiBrowserContext extends BrowserContext {
     if (this.#isDefault) {
       throw new Error('Default context cannot be closed!');
     }
-
-    await this.#browser._closeContext(this);
-  }
-
-  override browser(): BidiBrowser {
-    return this.#browser;
+    const pages = await this.pages();
+    await Promise.all(
+      pages.map(async t => {
+        await t.close();
+      })
+    );
   }
 
   override async pages(): Promise<BidiPage[]> {
-    const results = await Promise.all(
-      [...this.targets()].map(t => {
-        return t.page();
+    return await Promise.all(
+      [...this.#pages.values()].map(t => {
+        return t.valueOrThrow();
       })
     );
-    return results.filter((p): p is BidiPage => {
-      return p !== null;
-    });
   }
 
   override isIncognito(): boolean {
     return !this.#isDefault;
+  }
+
+  override targets(): Target[] {
+    throw new UnsupportedOperation();
+  }
+  override waitForTarget(): Promise<Target> {
+    throw new UnsupportedOperation();
   }
 
   override overridePermissions(): never {

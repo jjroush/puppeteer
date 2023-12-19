@@ -1,187 +1,293 @@
 import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
-import type ProtocolMapping from 'devtools-protocol/types/protocol-mapping.js';
 
-import {CDPSession} from '../api/CDPSession.js';
-import type {Connection as CdpConnection} from '../cdp/Connection.js';
-import {TargetCloseError, UnsupportedOperation} from '../common/Errors.js';
-import type {EventType} from '../common/EventEmitter.js';
-import {debugError} from '../common/util.js';
-import {Deferred} from '../util/Deferred.js';
+import {EventEmitter, EventSubscription} from '../common/EventEmitter.js';
+import {throwIfDisposed} from '../util/decorators.js';
+import {DisposableStack} from '../util/disposable.js';
 
+import {BidiCdpSession} from './BidiCdpSession.js';
+import type {BidiBrowserContext} from './BrowserContext.js';
 import type {BidiConnection} from './Connection.js';
-import {BidiRealm} from './Realm.js';
+import {Navigation} from './Navigation.js';
+import {BidiRequest} from './Request.js';
+
+export type CaptureScreenshotOptions = Omit<
+  Bidi.BrowsingContext.CaptureScreenshotParameters,
+  'context'
+>;
+
+export type ReloadOptions = Omit<
+  Bidi.BrowsingContext.ReloadParameters,
+  'context'
+>;
+
+export type PrintOptions = Omit<
+  Bidi.BrowsingContext.PrintParameters,
+  'context'
+>;
+
+export type HandleUserPromptOptions = Omit<
+  Bidi.BrowsingContext.HandleUserPromptParameters,
+  'context'
+>;
 
 /**
  * @internal
  */
-export const cdpSessions = new Map<string, CdpSessionWrapper>();
-
-/**
- * @internal
- */
-export class CdpSessionWrapper extends CDPSession {
-  #context: BrowsingContext;
-  #sessionId = Deferred.create<string>();
-  #detached = false;
-
-  constructor(context: BrowsingContext, sessionId?: string) {
-    super();
-    this.#context = context;
-    if (!this.#context.supportsCdp()) {
-      return;
-    }
-    if (sessionId) {
-      this.#sessionId.resolve(sessionId);
-      cdpSessions.set(sessionId, this);
-    } else {
-      context.connection
-        .send('cdp.getSession', {
-          context: context.id,
-        })
-        .then(session => {
-          this.#sessionId.resolve(session.result.session!);
-          cdpSessions.set(session.result.session!, this);
-        })
-        .catch(err => {
-          this.#sessionId.reject(err);
-        });
-    }
+export class BrowsingContext extends EventEmitter<{
+  // Emitted when a child context is created.
+  created: BrowsingContext;
+  // Emitted when a child context or itself is destroyed.
+  destroyed: BrowsingContext;
+  // Emitted whenever the navigation occurs.
+  navigation: Navigation;
+  // Emitted whenever a request is made.
+  request: BidiRequest;
+}> {
+  static createTopContext(
+    browserContext: BidiBrowserContext,
+    id: string,
+    url: string
+  ): BrowsingContext {
+    return new BrowsingContext(browserContext, undefined, id, url);
   }
 
-  override connection(): CdpConnection | undefined {
-    return undefined;
-  }
-
-  override async send<T extends keyof ProtocolMapping.Commands>(
-    method: T,
-    ...paramArgs: ProtocolMapping.Commands[T]['paramsType']
-  ): Promise<ProtocolMapping.Commands[T]['returnType']> {
-    if (!this.#context.supportsCdp()) {
-      throw new UnsupportedOperation(
-        'CDP support is required for this feature. The current browser does not support CDP.'
-      );
-    }
-    if (this.#detached) {
-      throw new TargetCloseError(
-        `Protocol error (${method}): Session closed. Most likely the page has been closed.`
-      );
-    }
-    const session = await this.#sessionId.valueOrThrow();
-    const {result} = await this.#context.connection.send('cdp.sendCommand', {
-      method: method,
-      params: paramArgs[0],
-      session,
-    });
-    return result.result;
-  }
-
-  override async detach(): Promise<void> {
-    cdpSessions.delete(this.id());
-    if (!this.#detached && this.#context.supportsCdp()) {
-      await this.#context.cdpSession.send('Target.detachFromTarget', {
-        sessionId: this.id(),
-      });
-    }
-    this.#detached = true;
-  }
-
-  override id(): string {
-    const val = this.#sessionId.value();
-    return val instanceof Error || val === undefined ? '' : val;
-  }
-}
-
-/**
- * Internal events that the BrowsingContext class emits.
- *
- * @internal
- */
-// eslint-disable-next-line @typescript-eslint/no-namespace
-export namespace BrowsingContextEvent {
-  /**
-   * Emitted on the top-level context, when a descendant context is created.
-   */
-  export const Created = Symbol('BrowsingContext.created');
-  /**
-   * Emitted on the top-level context, when a descendant context or the
-   * top-level context itself is destroyed.
-   */
-  export const Destroyed = Symbol('BrowsingContext.destroyed');
-}
-
-/**
- * @internal
- */
-export interface BrowsingContextEvents extends Record<EventType, unknown> {
-  [BrowsingContextEvent.Created]: BrowsingContext;
-  [BrowsingContextEvent.Destroyed]: BrowsingContext;
-}
-
-/**
- * @internal
- */
-export class BrowsingContext extends BidiRealm {
-  #id: string;
+  readonly #browserContext: BidiBrowserContext;
+  readonly #parent: BrowsingContext | undefined;
+  readonly id: string;
   #url: string;
-  #cdpSession: CDPSession;
-  #parent?: string | null;
-  #browserName = '';
 
-  constructor(
-    connection: BidiConnection,
-    info: Bidi.BrowsingContext.Info,
-    browserName: string
+  readonly #disposables = new DisposableStack();
+  readonly #children = new Map<string, BrowsingContext>();
+
+  readonly #cdpSession: BidiCdpSession;
+
+  // Only a single navigation can occur at a time.
+  #navigation?: Navigation;
+
+  // A map of ongoing requests.
+  readonly #requests = new Map<string, BidiRequest>();
+
+  private constructor(
+    browserContext: BidiBrowserContext,
+    parent: BrowsingContext | undefined,
+    id: string,
+    url: string
   ) {
-    super(connection);
-    this.#id = info.context;
-    this.#url = info.url;
-    this.#parent = info.parent;
-    this.#browserName = browserName;
-    this.#cdpSession = new CdpSessionWrapper(this, undefined);
+    super();
 
-    this.on('browsingContext.domContentLoaded', this.#updateUrl.bind(this));
-    this.on('browsingContext.fragmentNavigated', this.#updateUrl.bind(this));
-    this.on('browsingContext.load', this.#updateUrl.bind(this));
+    this.#browserContext = browserContext;
+    this.#parent = parent;
+    this.id = id;
+    this.#url = url;
+
+    this.#cdpSession = new BidiCdpSession(this);
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'browsingContext.contextCreated',
+        (info: Bidi.BrowsingContext.Info) => {
+          if (info.parent !== this.id) {
+            return;
+          }
+          const context = new BrowsingContext(
+            this.#browserContext,
+            this,
+            info.context,
+            info.url
+          );
+          this.#children.set(info.context, context);
+          this.emit('created', context);
+
+          this.#disposables.use(
+            new EventSubscription(
+              context,
+              'destroyed',
+              (destroyedContext: BrowsingContext) => {
+                if (destroyedContext !== context) {
+                  return;
+                }
+                this.#children.delete(context.id);
+                this.emit('destroyed', context);
+              }
+            )
+          );
+        }
+      )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'browsingContext.contextDestroyed',
+        (info: Bidi.BrowsingContext.Info) => {
+          if (info.context !== this.id) {
+            return;
+          }
+          this.#disposables.dispose();
+          this.emit('destroyed', this);
+          this.removeAllListeners();
+        }
+      )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'browsingContext.navigationStarted',
+        (info: Bidi.BrowsingContext.NavigationInfo) => {
+          if (info.context !== this.id) {
+            return;
+          }
+          this.#url = info.url;
+          this.#navigation = new Navigation(this, info.navigation, info.url);
+          this.emit('navigation', this.#navigation);
+        }
+      )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'network.beforeRequestSent',
+        (event: Bidi.Network.BeforeRequestSentParameters) => {
+          if (event.context !== this.id) {
+            return;
+          }
+          if (event.navigation) {
+            return;
+          }
+          const request = new BidiRequest(this, undefined, event);
+          this.#requests.set(request.id, request);
+          this.emit('request', request);
+        }
+      )
+    );
   }
 
-  supportsCdp(): boolean {
-    return !this.#browserName.toLowerCase().includes('firefox');
+  get disposed(): boolean {
+    return this.#disposables.disposed;
   }
 
-  #updateUrl(info: Bidi.BrowsingContext.NavigationInfo) {
-    this.#url = info.url;
+  get parent(): BrowsingContext | undefined {
+    return this.#parent;
   }
 
-  createRealmForSandbox(): BidiRealm {
-    return new BidiRealm(this.connection);
+  get children(): Iterable<BrowsingContext> {
+    return this.#children.values();
+  }
+
+  get top(): BrowsingContext {
+    let context = this as BrowsingContext;
+    for (let {parent} = context; parent; {parent} = context) {
+      context = parent;
+    }
+    return context;
   }
 
   get url(): string {
     return this.#url;
   }
 
-  get id(): string {
-    return this.#id;
+  get navigation(): Navigation | undefined {
+    return this.#navigation;
   }
 
-  get parent(): string | undefined | null {
-    return this.#parent;
+  get browserContext(): BidiBrowserContext {
+    return this.#browserContext;
   }
 
-  get cdpSession(): CDPSession {
+  get cdpSession(): BidiCdpSession {
     return this.#cdpSession;
   }
 
-  async sendCdpCommand<T extends keyof ProtocolMapping.Commands>(
-    method: T,
-    ...paramArgs: ProtocolMapping.Commands[T]['paramsType']
-  ): Promise<ProtocolMapping.Commands[T]['returnType']> {
-    return await this.#cdpSession.send(method, ...paramArgs);
+  get #connection(): BidiConnection {
+    return this.#browserContext.browser().connection;
   }
 
-  dispose(): void {
-    this.removeAllListeners();
-    this.connection.unregisterBrowsingContexts(this.#id);
-    void this.#cdpSession.detach().catch(debugError);
+  @throwIfDisposed()
+  async activate(): Promise<void> {
+    await this.#connection.send('browsingContext.activate', {
+      context: this.id,
+    });
+  }
+
+  @throwIfDisposed()
+  async captureScreenshot(
+    options: CaptureScreenshotOptions = {}
+  ): Promise<string> {
+    const {
+      result: {data},
+    } = await this.#connection.send('browsingContext.captureScreenshot', {
+      context: this.id,
+      ...options,
+    });
+    return data;
+  }
+
+  @throwIfDisposed()
+  async close(promptUnload?: boolean): Promise<void> {
+    await Promise.all(
+      [...this.#children.values()].map(async child => {
+        await child.close(promptUnload);
+      })
+    );
+    await this.#connection.send('browsingContext.close', {
+      context: this.id,
+      promptUnload,
+    });
+  }
+
+  @throwIfDisposed()
+  async traverseHistory(delta: number): Promise<void> {
+    await this.#connection.send('browsingContext.traverseHistory', {
+      context: this.id,
+      delta,
+    });
+  }
+
+  @throwIfDisposed()
+  async navigate(
+    url: string,
+    wait?: Bidi.BrowsingContext.ReadinessState
+  ): Promise<Navigation> {
+    await this.#connection.send('browsingContext.navigate', {
+      context: this.id,
+      url,
+      wait,
+    });
+    return await new Promise(resolve => {
+      this.once('navigation', resolve);
+    });
+  }
+
+  @throwIfDisposed()
+  async reload(options: ReloadOptions = {}): Promise<Navigation> {
+    await this.#connection.send('browsingContext.reload', {
+      context: this.id,
+      ...options,
+    });
+    return await new Promise(resolve => {
+      this.once('navigation', resolve);
+    });
+  }
+
+  @throwIfDisposed()
+  async print(options: PrintOptions = {}): Promise<string> {
+    const {
+      result: {data},
+    } = await this.#connection.send('browsingContext.print', {
+      context: this.id,
+      ...options,
+    });
+    return data;
+  }
+
+  @throwIfDisposed()
+  async handleUserPrompt(options: HandleUserPromptOptions = {}): Promise<void> {
+    await this.#connection.send('browsingContext.handleUserPrompt', {
+      context: this.id,
+      ...options,
+    });
   }
 }

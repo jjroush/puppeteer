@@ -17,83 +17,159 @@
 import * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
 import {
-  type Observable,
-  from,
-  fromEvent,
-  merge,
-  map,
-  forkJoin,
   first,
   firstValueFrom,
+  forkJoin,
+  from,
+  fromEvent,
+  map,
+  merge,
   raceWith,
+  type Observable,
+  zip,
+  throwError,
+  debounceTime,
+  bufferCount,
+  mergeMap,
 } from '../../third_party/rxjs/rxjs.js';
 import type {CDPSession} from '../api/CDPSession.js';
 import type {ElementHandle} from '../api/ElementHandle.js';
 import {
   Frame,
+  FrameEvent,
+  throwIfDetached,
   type GoToOptions,
   type WaitForOptions,
-  throwIfDetached,
 } from '../api/Frame.js';
-import type {WaitForSelectorOptions} from '../api/Page.js';
+import {PageEvent, type WaitForSelectorOptions} from '../api/Page.js';
 import {UnsupportedOperation} from '../common/Errors.js';
+import {EventSubscription} from '../common/EventEmitter.js';
 import type {TimeoutSettings} from '../common/TimeoutSettings.js';
 import type {Awaitable, NodeFor} from '../common/types.js';
-import {UTILITY_WORLD_NAME, timeout} from '../common/util.js';
-import {Deferred} from '../util/Deferred.js';
-import {disposeSymbol} from '../util/disposable.js';
+import {timeout} from '../common/util.js';
+import {DisposableStack} from '../util/disposable.js';
 
 import type {BrowsingContext} from './BrowsingContext.js';
 import {ExposeableFunction} from './ExposedFunction.js';
-import type {BidiHTTPResponse} from './HTTPResponse.js';
+import {BidiHTTPResponse} from './HTTPResponse.js';
 import {
   getBiDiLifecycleEvent,
   getBiDiReadinessState,
   rewriteNavigationError,
 } from './lifecycle.js';
 import type {BidiPage} from './Page.js';
-import {
-  MAIN_SANDBOX,
-  PUPPETEER_SANDBOX,
-  Sandbox,
-  type SandboxChart,
-} from './Sandbox.js';
+import type {Sandbox} from './Sandbox.js';
+import {BidiRequest} from './Request.js';
+import {BidiHTTPRequest} from './HTTPRequest.js';
+import {Navigation} from './Navigation.js';
 
 /**
  * Puppeteer's Frame class could be viewed as a BiDi BrowsingContext implementation
  * @internal
  */
 export class BidiFrame extends Frame {
-  #page: BidiPage;
-  #context: BrowsingContext;
-  #timeoutSettings: TimeoutSettings;
-  #abortDeferred = Deferred.create<never>();
-  #disposed = false;
-  sandboxes: SandboxChart;
-  override _id: string;
-
-  constructor(
+  static createRootFrame(
     page: BidiPage,
     context: BrowsingContext,
-    timeoutSettings: TimeoutSettings,
-    parentId?: string | null
+    timeoutSettings: TimeoutSettings
+  ): BidiFrame {
+    return new BidiFrame(page, undefined, context, timeoutSettings);
+  }
+
+  static #rootOnly<T extends (this: BidiFrame, ...args: unknown[]) => unknown>(
+    target: T,
+    _: unknown
+  ) {
+    return function (this: BidiFrame, ...args: Parameters<T>) {
+      if (this.#parent) {
+        throw new Error(`Can only call ${target.name} on top-level frames.`);
+      }
+      return target.call(this, ...args);
+    };
+  }
+
+  #page: BidiPage;
+  #parent: BidiFrame | undefined;
+  #context: BrowsingContext;
+  #timeoutSettings: TimeoutSettings;
+
+  #children = new Map<string, BidiFrame>();
+
+  #disposables = new DisposableStack();
+
+  private constructor(
+    page: BidiPage,
+    parent: BidiFrame | undefined,
+    context: BrowsingContext,
+    timeoutSettings: TimeoutSettings
   ) {
     super();
     this.#page = page;
+    this.#parent = parent;
     this.#context = context;
     this.#timeoutSettings = timeoutSettings;
-    this._id = this.#context.id;
-    this._parentId = parentId ?? undefined;
 
-    this.sandboxes = {
-      [MAIN_SANDBOX]: new Sandbox(undefined, this, context, timeoutSettings),
-      [PUPPETEER_SANDBOX]: new Sandbox(
-        UTILITY_WORLD_NAME,
-        this,
-        context.createRealmForSandbox(),
-        timeoutSettings
-      ),
-    };
+    this.#disposables.use(
+      new EventSubscription(
+        this.#context,
+        'created',
+        (context: BrowsingContext) => {
+          const frame = new BidiFrame(
+            this.#page,
+            this,
+            context,
+            this.#timeoutSettings
+          );
+          this.#children.set(context.id, frame);
+          this.#page.emit(PageEvent.FrameAttached, frame);
+
+          this.#disposables.use(
+            new EventSubscription(
+              context,
+              'destroyed',
+              (destroyedContext: BrowsingContext) => {
+                if (destroyedContext !== context) {
+                  return;
+                }
+                this.#children.delete(context.id);
+              }
+            )
+          );
+        }
+      )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#context,
+        'destroyed',
+        (context: BrowsingContext) => {
+          if (context !== this.#context) {
+            return;
+          }
+          this.#disposables.dispose();
+          this.emit(FrameEvent.FrameDetached, this);
+          this.page().emit(PageEvent.FrameDetached, this);
+          this.removeAllListeners();
+        }
+      )
+    );
+  }
+
+  *getDescendants(): Iterable<BidiFrame> {
+    const frames: BidiFrame[] = [this];
+    for (let frame = frames.shift(); frame; frame = frames.shift()) {
+      yield frame;
+      frames.push(...frame.childFrames());
+    }
+  }
+
+  override get detached(): boolean {
+    return this.#context.disposed;
+  }
+
+  override get _id(): string {
+    return this.#context.id;
   }
 
   override get client(): CDPSession {
@@ -101,11 +177,11 @@ export class BidiFrame extends Frame {
   }
 
   override mainRealm(): Sandbox {
-    return this.sandboxes[MAIN_SANDBOX];
+    throw new UnsupportedOperation('Not implemented');
   }
 
   override isolatedRealm(): Sandbox {
-    return this.sandboxes[PUPPETEER_SANDBOX];
+    throw new UnsupportedOperation('Not implemented');
   }
 
   override page(): BidiPage {
@@ -121,11 +197,11 @@ export class BidiFrame extends Frame {
   }
 
   override parentFrame(): BidiFrame | null {
-    return this.#page.frame(this._parentId ?? '');
+    return this.#parent ?? null;
   }
 
   override childFrames(): BidiFrame[] {
-    return this.#page.childFrames(this.#context.id);
+    return [...this.#children.values()];
   }
 
   @throwIfDetached
@@ -133,28 +209,8 @@ export class BidiFrame extends Frame {
     url: string,
     options: GoToOptions = {}
   ): Promise<BidiHTTPResponse | null> {
-    const {
-      waitUntil = 'load',
-      timeout: ms = this.#timeoutSettings.navigationTimeout(),
-    } = options;
-
-    const [readiness, networkIdle] = getBiDiReadinessState(waitUntil);
-
-    const response = await firstValueFrom(
-      this.#page
-        ._waitWithNetworkIdle(
-          this.#context.connection.send('browsingContext.navigate', {
-            context: this.#context.id,
-            url,
-            wait: readiness,
-          }),
-          networkIdle
-        )
-        .pipe(raceWith(timeout(ms), from(this.#abortDeferred.valueOrThrow())))
-        .pipe(rewriteNavigationError(url, ms))
-    );
-
-    return this.#page.getNavigationResponse(response?.result.navigation);
+    void this.#context.navigate(url);
+    return await this.waitForNavigation(options);
   }
 
   @throwIfDetached
@@ -162,29 +218,8 @@ export class BidiFrame extends Frame {
     html: string,
     options: WaitForOptions = {}
   ): Promise<void> {
-    const {
-      waitUntil = 'load',
-      timeout: ms = this.#timeoutSettings.navigationTimeout(),
-    } = options;
-
-    const [waitEvent, networkIdle] = getBiDiLifecycleEvent(waitUntil);
-
-    await firstValueFrom(
-      this.#page
-        ._waitWithNetworkIdle(
-          forkJoin([
-            fromEvent(this.#context, waitEvent).pipe(first()),
-            from(this.setFrameContent(html)),
-          ]).pipe(
-            map(() => {
-              return null;
-            })
-          ),
-          networkIdle
-        )
-        .pipe(raceWith(timeout(ms), from(this.#abortDeferred.valueOrThrow())))
-        .pipe(rewriteNavigationError('setContent', ms))
-    );
+    void this.setFrameContent(html);
+    await this.waitForNavigation(options);
   }
 
   context(): BrowsingContext {
@@ -200,57 +235,21 @@ export class BidiFrame extends Frame {
       timeout: ms = this.#timeoutSettings.navigationTimeout(),
     } = options;
 
-    const [waitUntilEvent, networkIdle] = getBiDiLifecycleEvent(waitUntil);
+    const [eventName, requestCount] = getBiDiLifecycleEvent(waitUntil);
 
-    const navigatedObservable = merge(
-      forkJoin([
-        fromEvent(
-          this.#context,
-          Bidi.ChromiumBidi.BrowsingContext.EventNames.NavigationStarted
-        ).pipe(first()),
-        fromEvent(this.#context, waitUntilEvent).pipe(
-          first()
-        ) as Observable<Bidi.BrowsingContext.NavigationInfo>,
-      ]),
-      fromEvent(
-        this.#context,
-        Bidi.ChromiumBidi.BrowsingContext.EventNames.FragmentNavigated
-      ) as Observable<Bidi.BrowsingContext.NavigationInfo>
-    ).pipe(
-      map(result => {
-        if (Array.isArray(result)) {
-          return {result: result[1]};
-        }
-        return {result};
+    const [readiness, networkIdle] = getBiDiReadinessState(waitUntil);
+
+    const response$ = from(this.#context.navigate(url, readiness)).pipe(
+      mergeMap(navigation => {
+        const request = new BidiHTTPRequest(navigation.request);
+        return new BidiHTTPResponse(request);
       })
     );
-
-    const response = await firstValueFrom(
-      this.#page
-        ._waitWithNetworkIdle(navigatedObservable, networkIdle)
-        .pipe(raceWith(timeout(ms), from(this.#abortDeferred.valueOrThrow())))
-    );
-
-    return this.#page.getNavigationResponse(response?.result.navigation);
+    return await firstValueFrom(response$);
   }
 
   override waitForDevicePrompt(): never {
     throw new UnsupportedOperation();
-  }
-
-  override get detached(): boolean {
-    return this.#disposed;
-  }
-
-  [disposeSymbol](): void {
-    if (this.#disposed) {
-      return;
-    }
-    this.#disposed = true;
-    this.#abortDeferred.reject(new Error('Frame detached'));
-    this.#context.dispose();
-    this.sandboxes[MAIN_SANDBOX][disposeSymbol]();
-    this.sandboxes[PUPPETEER_SANDBOX][disposeSymbol]();
   }
 
   #exposedFunctions = new Map<string, ExposeableFunction<never[], unknown>>();

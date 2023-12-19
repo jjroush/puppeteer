@@ -298,7 +298,7 @@ export class BidiKeyboard extends Keyboard {
     key: KeyInput,
     _options?: Readonly<KeyDownOptions>
   ): Promise<void> {
-    await this.#page.connection.send('input.performActions', {
+    await this.#page.#connection.send('input.performActions', {
       context: this.#page.mainFrame()._id,
       actions: [
         {
@@ -316,7 +316,7 @@ export class BidiKeyboard extends Keyboard {
   }
 
   override async up(key: KeyInput): Promise<void> {
-    await this.#page.connection.send('input.performActions', {
+    await this.#page.#connection.send('input.performActions', {
       context: this.#page.mainFrame()._id,
       actions: [
         {
@@ -354,7 +354,7 @@ export class BidiKeyboard extends Keyboard {
       type: ActionType.KeyUp,
       value: getBidiKeyValue(key),
     });
-    await this.#page.connection.send('input.performActions', {
+    await this.#page.#connection.send('input.performActions', {
       context: this.#page.mainFrame()._id,
       actions: [
         {
@@ -406,7 +406,7 @@ export class BidiKeyboard extends Keyboard {
         );
       }
     }
-    await this.#page.connection.send('input.performActions', {
+    await this.#page.#connection.send('input.performActions', {
       context: this.#page.mainFrame()._id,
       actions: [
         {
