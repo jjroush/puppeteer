@@ -14,26 +14,25 @@
  * limitations under the License.
  */
 
-import * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
-
+import type {Observable} from '../../third_party/rxjs/rxjs.js';
 import {
-  first,
+  bufferCount,
+  concat,
+  debounceTime,
+  filterAsync,
   firstValueFrom,
-  forkJoin,
   from,
   fromEvent,
   map,
   merge,
+  of,
   raceWith,
-  type Observable,
+  switchMap,
   zip,
-  throwError,
-  debounceTime,
-  bufferCount,
-  mergeMap,
 } from '../../third_party/rxjs/rxjs.js';
 import type {CDPSession} from '../api/CDPSession.js';
-import type {ElementHandle} from '../api/ElementHandle.js';
+import type {BoundingBox, ElementHandle} from '../api/ElementHandle.js';
+import type {FrameEvents} from '../api/Frame.js';
 import {
   Frame,
   FrameEvent,
@@ -41,27 +40,39 @@ import {
   type GoToOptions,
   type WaitForOptions,
 } from '../api/Frame.js';
+import type {HTTPRequest} from '../api/HTTPRequest.js';
+import type {HTTPResponse} from '../api/HTTPResponse.js';
+import type {
+  AwaitablePredicate,
+  ScreenshotOptions,
+  WaitTimeoutOptions,
+} from '../api/Page.js';
 import {PageEvent, type WaitForSelectorOptions} from '../api/Page.js';
 import {UnsupportedOperation} from '../common/Errors.js';
 import {EventSubscription} from '../common/EventEmitter.js';
+import type {PDFOptions} from '../common/PDFOptions.js';
 import type {TimeoutSettings} from '../common/TimeoutSettings.js';
 import type {Awaitable, NodeFor} from '../common/types.js';
-import {timeout} from '../common/util.js';
+import {
+  NETWORK_IDLE_TIME,
+  fromEmitterEvent,
+  importFSPromises,
+  parsePDFOptions,
+  timeout,
+} from '../common/util.js';
 import {DisposableStack} from '../util/disposable.js';
 
+import {BidiCdpSession} from './BidiCdpSession.js';
+import type {BidiBrowserContext} from './BrowserContext.js';
 import type {BrowsingContext} from './BrowsingContext.js';
+import {BidiElementHandle} from './ElementHandle.js';
 import {ExposeableFunction} from './ExposedFunction.js';
-import {BidiHTTPResponse} from './HTTPResponse.js';
-import {
-  getBiDiLifecycleEvent,
-  getBiDiReadinessState,
-  rewriteNavigationError,
-} from './lifecycle.js';
-import type {BidiPage} from './Page.js';
-import type {Sandbox} from './Sandbox.js';
-import {BidiRequest} from './Request.js';
 import {BidiHTTPRequest} from './HTTPRequest.js';
-import {Navigation} from './Navigation.js';
+import type {BidiHTTPResponse} from './HTTPResponse.js';
+import type {Navigation} from './Navigation.js';
+import type {BidiPage} from './Page.js';
+import type {BidiRequest} from './Request.js';
+import type {Sandbox} from './Sandbox.js';
 
 /**
  * Puppeteer's Frame class could be viewed as a BiDi BrowsingContext implementation
@@ -76,11 +87,11 @@ export class BidiFrame extends Frame {
     return new BidiFrame(page, undefined, context, timeoutSettings);
   }
 
-  static #rootOnly<T extends (this: BidiFrame, ...args: unknown[]) => unknown>(
-    target: T,
+  static #rootOnly<T extends unknown[], R>(
+    target: (this: BidiFrame, ...args: T) => R,
     _: unknown
-  ) {
-    return function (this: BidiFrame, ...args: Parameters<T>) {
+  ): (this: BidiFrame, ...args: T) => R {
+    return function (this: BidiFrame, ...args: T) {
       if (this.#parent) {
         throw new Error(`Can only call ${target.name} on top-level frames.`);
       }
@@ -88,14 +99,15 @@ export class BidiFrame extends Frame {
     };
   }
 
-  #page: BidiPage;
-  #parent: BidiFrame | undefined;
-  #context: BrowsingContext;
-  #timeoutSettings: TimeoutSettings;
+  readonly #page: BidiPage;
+  readonly #parent: BidiFrame | undefined;
+  readonly #context: BrowsingContext;
+  readonly #timeoutSettings: TimeoutSettings;
 
-  #children = new Map<string, BidiFrame>();
-
-  #disposables = new DisposableStack();
+  readonly #children = new Map<string, BidiFrame>();
+  // A map of ongoing requests.
+  readonly #requests = new Map<string, BidiHTTPRequest>();
+  readonly #disposables = new DisposableStack();
 
   private constructor(
     page: BidiPage,
@@ -154,14 +166,24 @@ export class BidiFrame extends Frame {
         }
       )
     );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#context,
+        'request',
+        (request: BidiRequest) => {
+          const httpRequest = new BidiHTTPRequest(this, request);
+          this.#requests.set(request.id, httpRequest);
+
+          this.bubbleEmit(FrameEvent.Request, httpRequest);
+          this.page().emit(PageEvent.Request, httpRequest);
+        }
+      )
+    );
   }
 
-  *getDescendants(): Iterable<BidiFrame> {
-    const frames: BidiFrame[] = [this];
-    for (let frame = frames.shift(); frame; frame = frames.shift()) {
-      yield frame;
-      frames.push(...frame.childFrames());
-    }
+  get browserContext(): BidiBrowserContext {
+    return this.#context.browserContext;
   }
 
   override get detached(): boolean {
@@ -173,7 +195,287 @@ export class BidiFrame extends Frame {
   }
 
   override get client(): CDPSession {
-    return this.context().cdpSession;
+    return this.#context.cdpSession;
+  }
+
+  bubbleEmit<FrameEvent extends keyof FrameEvents>(
+    event: FrameEvent,
+    data: FrameEvents[FrameEvent]
+  ): void {
+    this.emit(event, data);
+    if (this.#parent) {
+      this.#parent.bubbleEmit(event, data);
+    }
+  }
+
+  *getDescendants(): Iterable<BidiFrame> {
+    const frames: BidiFrame[] = [this];
+    for (let frame = frames.shift(); frame; frame = frames.shift()) {
+      yield frame;
+      frames.push(...frame.childFrames());
+    }
+  }
+
+  @throwIfDetached
+  async createCDPSession(): Promise<CDPSession> {
+    const {sessionId} = await this.#context.cdpSession.send(
+      'Target.attachToTarget',
+      {
+        targetId: this._id,
+        flatten: true,
+      }
+    );
+    return new BidiCdpSession(this.#context, sessionId);
+  }
+
+  @throwIfDetached
+  @BidiFrame.#rootOnly
+  async bringToFront(): Promise<void> {
+    await this.#context.activate();
+  }
+
+  @throwIfDetached
+  async reload(options?: WaitForOptions): Promise<BidiHTTPResponse | null> {
+    void this.#context.reload();
+    return await this.waitForNavigation(options);
+  }
+
+  @throwIfDetached
+  @BidiFrame.#rootOnly
+  async close(options?: {runBeforeUnload?: boolean}): Promise<void> {
+    await this.#context.close(options?.runBeforeUnload ?? false);
+  }
+
+  @throwIfDetached
+  @BidiFrame.#rootOnly
+  async pdf(options: PDFOptions = {}): Promise<Buffer> {
+    const {path = undefined, timeout: ms = this.#timeoutSettings.timeout()} =
+      options;
+    const {
+      printBackground: background,
+      margin,
+      landscape,
+      width,
+      height,
+      pageRanges: ranges,
+      scale,
+      preferCSSPageSize,
+    } = parsePDFOptions(options, 'cm');
+
+    const pageRanges = ranges ? ranges.split(', ') : [];
+    const data = await firstValueFrom(
+      from(
+        this.#context.print({
+          background,
+          margin,
+          orientation: landscape ? 'landscape' : 'portrait',
+          page: {
+            width,
+            height,
+          },
+          pageRanges,
+          scale,
+          shrinkToFit: !preferCSSPageSize,
+        })
+      ).pipe(raceWith(timeout(ms)))
+    );
+
+    const buffer = Buffer.from(data, 'base64');
+    if (path) {
+      const fs = await importFSPromises();
+      await fs.writeFile(path, buffer);
+    }
+    return buffer;
+  }
+
+  @throwIfDetached
+  async screenshot(options: Readonly<ScreenshotOptions>): Promise<string> {
+    const {clip, type, captureBeyondViewport, quality} = options;
+    if (options.omitBackground !== undefined && options.omitBackground) {
+      throw new UnsupportedOperation(`BiDi does not support 'omitBackground'.`);
+    }
+    if (options.optimizeForSpeed !== undefined && options.optimizeForSpeed) {
+      throw new UnsupportedOperation(
+        `BiDi does not support 'optimizeForSpeed'.`
+      );
+    }
+    if (options.fromSurface !== undefined && !options.fromSurface) {
+      throw new UnsupportedOperation(`BiDi does not support 'fromSurface'.`);
+    }
+    if (clip !== undefined && clip.scale !== undefined && clip.scale !== 1) {
+      throw new UnsupportedOperation(
+        `BiDi does not support 'scale' in 'clip'.`
+      );
+    }
+
+    let box: BoundingBox | undefined;
+    if (clip) {
+      if (captureBeyondViewport) {
+        box = clip;
+      } else {
+        // The clip is always with respect to the document coordinates, so we
+        // need to convert this to viewport coordinates when we aren't capturing
+        // beyond the viewport.
+        const [pageLeft, pageTop] = await this.evaluate(() => {
+          if (!window.visualViewport) {
+            throw new Error('window.visualViewport is not supported.');
+          }
+          return [
+            window.visualViewport.pageLeft,
+            window.visualViewport.pageTop,
+          ] as const;
+        });
+        box = {
+          ...clip,
+          x: clip.x - pageLeft,
+          y: clip.y - pageTop,
+        };
+      }
+    }
+
+    return await this.#context.captureScreenshot({
+      origin: captureBeyondViewport ? 'document' : 'viewport',
+      format: {
+        type: `image/${type}`,
+        ...(quality !== undefined ? {quality: quality / 100} : {}),
+      },
+      ...(box ? {clip: {type: 'box', ...box}} : {}),
+    });
+  }
+
+  @throwIfDetached
+  async focusedFrame(): Promise<BidiFrame> {
+    using frame = await this.isolatedRealm().evaluateHandle(() => {
+      let frame: HTMLIFrameElement | undefined;
+      let win: Window | null = window;
+      while (win?.document.activeElement instanceof HTMLIFrameElement) {
+        frame = win.document.activeElement;
+        win = frame.contentWindow;
+      }
+      return frame;
+    });
+    if (!(frame instanceof BidiElementHandle)) {
+      return this;
+    }
+    return await frame.contentFrame();
+  }
+
+  #exposedFunctions = new Map<string, ExposeableFunction<never[], unknown>>();
+  @throwIfDetached
+  async exposeFunction<Args extends unknown[], Ret>(
+    name: string,
+    apply: (...args: Args) => Awaitable<Ret>
+  ): Promise<void> {
+    if (this.#exposedFunctions.has(name)) {
+      throw new Error(
+        `Failed to add page binding with name ${name}: globalThis['${name}'] already exists!`
+      );
+    }
+    const exposeable = new ExposeableFunction(this, name, apply);
+    this.#exposedFunctions.set(name, exposeable);
+    try {
+      await exposeable.expose();
+    } catch (error) {
+      this.#exposedFunctions.delete(name);
+      throw error;
+    }
+  }
+
+  @throwIfDetached
+  async waitForRequest(
+    urlOrPredicate: string | AwaitablePredicate<HTTPRequest>,
+    options: WaitTimeoutOptions = {}
+  ): Promise<HTTPRequest> {
+    const {timeout: ms = this.#timeoutSettings.timeout()} = options;
+
+    if (typeof urlOrPredicate === 'string') {
+      const url = urlOrPredicate;
+      urlOrPredicate = request => {
+        return request.url() === url;
+      };
+    }
+
+    const request$ = merge(
+      fromEmitterEvent(this, FrameEvent.Request),
+      fromEmitterEvent(this, FrameEvent.RequestFailed),
+      fromEmitterEvent(this, FrameEvent.RequestFinished)
+    ).pipe(filterAsync(urlOrPredicate));
+
+    return await firstValueFrom(
+      request$.pipe(
+        raceWith(
+          timeout(ms),
+          fromEmitterEvent(this, FrameEvent.FrameDetached).pipe(
+            map(() => {
+              throw new Error('Page closed.');
+            })
+          )
+        )
+      )
+    );
+  }
+
+  @throwIfDetached
+  async waitForResponse(
+    urlOrPredicate: string | AwaitablePredicate<HTTPResponse>,
+    options: WaitTimeoutOptions = {}
+  ): Promise<HTTPResponse> {
+    const {timeout: ms = this.#timeoutSettings.timeout()} = options;
+
+    if (typeof urlOrPredicate === 'string') {
+      const url = urlOrPredicate;
+      urlOrPredicate = request => {
+        return request.url() === url;
+      };
+    }
+
+    const request$ = fromEmitterEvent(this, FrameEvent.Response).pipe(
+      filterAsync(urlOrPredicate)
+    );
+
+    return await firstValueFrom(
+      request$.pipe(
+        raceWith(
+          timeout(ms),
+          fromEmitterEvent(this, FrameEvent.FrameDetached).pipe(
+            map(() => {
+              throw new Error('Page closed.');
+            })
+          )
+        )
+      )
+    );
+  }
+
+  @throwIfDetached
+  async waitForNetworkIdle(
+    options: {idleTime?: number; timeout?: number} = {}
+  ): Promise<void> {
+    const {
+      idleTime = NETWORK_IDLE_TIME,
+      timeout: ms = this.#timeoutSettings.timeout(),
+    } = options;
+
+    const idle$ = concat(
+      of(null),
+      fromEmitterEvent(this, PageEvent.Request),
+      fromEmitterEvent(this, PageEvent.RequestFinished),
+      fromEmitterEvent(this, PageEvent.RequestFailed),
+      fromEmitterEvent(this, PageEvent.Response)
+    ).pipe(debounceTime(idleTime));
+
+    await firstValueFrom(
+      idle$.pipe(
+        raceWith(
+          timeout(ms),
+          fromEvent(this, PageEvent.Close).pipe(
+            map(() => {
+              throw new Error('Page closed.');
+            })
+          )
+        )
+      )
+    );
   }
 
   override mainRealm(): Sandbox {
@@ -222,57 +524,94 @@ export class BidiFrame extends Frame {
     await this.waitForNavigation(options);
   }
 
-  context(): BrowsingContext {
-    return this.#context;
-  }
-
   @throwIfDetached
   override async waitForNavigation(
     options: WaitForOptions = {}
   ): Promise<BidiHTTPResponse | null> {
-    const {
-      waitUntil = 'load',
-      timeout: ms = this.#timeoutSettings.navigationTimeout(),
-    } = options;
+    let {waitUntil = 'load'} = options;
+    const {timeout: ms = this.#timeoutSettings.navigationTimeout()} = options;
 
-    const [eventName, requestCount] = getBiDiLifecycleEvent(waitUntil);
+    if (!Array.isArray(waitUntil)) {
+      waitUntil = [waitUntil];
+    }
 
-    const [readiness, networkIdle] = getBiDiReadinessState(waitUntil);
+    let bidiEvent: 'load' | 'dom' | undefined;
+    let requestCount = Infinity;
+    for (const event of waitUntil) {
+      switch (event) {
+        case 'load': {
+          bidiEvent = 'load';
+          break;
+        }
+        case 'domcontentloaded': {
+          bidiEvent = 'dom';
+          break;
+        }
+        case 'networkidle0': {
+          requestCount = 0;
+          break;
+        }
+        case 'networkidle2': {
+          requestCount = 2;
+          break;
+        }
+      }
+    }
 
-    const response$ = from(this.#context.navigate(url, readiness)).pipe(
-      mergeMap(navigation => {
-        const request = new BidiHTTPRequest(navigation.request);
-        return new BidiHTTPResponse(request);
+    const idle$ = concat(
+      of(null),
+      (fromEvent(this.#context, 'request') as Observable<BidiRequest>).pipe(
+        bufferCount(requestCount + 1, 1)
+      )
+    ).pipe(debounceTime(500));
+
+    const navigation$ = (
+      fromEvent(this.#context, 'navigation') as Observable<Navigation>
+    ).pipe(
+      switchMap(navigation => {
+        if (bidiEvent !== undefined) {
+          return fromEvent(navigation, bidiEvent).pipe(
+            map(() => {
+              return navigation;
+            })
+          );
+        } else {
+          return of(navigation);
+        }
       })
     );
-    return await firstValueFrom(response$);
+
+    const navigation = await firstValueFrom(
+      zip(navigation$, idle$).pipe(
+        map(([navigation]) => {
+          return navigation;
+        }),
+        raceWith(
+          timeout(ms),
+          fromEmitterEvent(this, FrameEvent.FrameDetached).pipe(
+            map(() => {
+              throw new Error('Frame detached.');
+            })
+          )
+        )
+      )
+    );
+
+    // By now, the request should have come in if any.
+    const bidiRequest = await navigation.request();
+    if (!bidiRequest) {
+      return null;
+    }
+    const request = new BidiHTTPRequest(this, bidiRequest);
+    return request.response();
   }
 
   override waitForDevicePrompt(): never {
     throw new UnsupportedOperation();
   }
 
-  #exposedFunctions = new Map<string, ExposeableFunction<never[], unknown>>();
-  async exposeFunction<Args extends unknown[], Ret>(
-    name: string,
-    apply: (...args: Args) => Awaitable<Ret>
-  ): Promise<void> {
-    if (this.#exposedFunctions.has(name)) {
-      throw new Error(
-        `Failed to add page binding with name ${name}: globalThis['${name}'] already exists!`
-      );
-    }
-    const exposeable = new ExposeableFunction(this, name, apply);
-    this.#exposedFunctions.set(name, exposeable);
-    try {
-      await exposeable.expose();
-    } catch (error) {
-      this.#exposedFunctions.delete(name);
-      throw error;
-    }
-  }
-
-  override waitForSelector<Selector extends string>(
+  @throwIfDetached
+  override async waitForSelector<Selector extends string>(
     selector: Selector,
     options?: WaitForSelectorOptions
   ): Promise<ElementHandle<NodeFor<Selector>> | null> {
@@ -282,6 +621,6 @@ export class BidiFrame extends Frame {
       );
     }
 
-    return super.waitForSelector(selector, options);
+    return await super.waitForSelector(selector, options);
   }
 }

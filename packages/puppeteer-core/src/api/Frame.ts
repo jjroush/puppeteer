@@ -53,6 +53,7 @@ import {
   NodeLocator,
 } from './locators/locators.js';
 import type {Realm} from './Realm.js';
+import {HTTPRequest} from './HTTPRequest.js';
 
 /**
  * @public
@@ -189,6 +190,14 @@ export interface FrameEvents extends Record<EventType, unknown> {
   [FrameEvent.FrameDetached]: Frame;
   /** @internal */
   [FrameEvent.FrameSwappedByActivation]: undefined;
+  /** @internal */
+  [FrameEvent.Request]: HTTPRequest;
+  /** @internal */
+  [FrameEvent.RequestFinished]: HTTPRequest;
+  /** @internal */
+  [FrameEvent.RequestFailed]: HTTPRequest;
+  /** @internal */
+  [FrameEvent.Response]: HTTPResponse;
 }
 
 /**
@@ -209,6 +218,12 @@ export namespace FrameEvent {
   export const FrameSwappedByActivation = Symbol(
     'Frame.FrameSwappedByActivation'
   );
+
+  // Used in BiDi.
+  export const Request = Symbol('Frame.Request');
+  export const Response = Symbol('Frame.Response');
+  export const RequestFinished = Symbol('Frame.RequestFinished');
+  export const RequestFailed = Symbol('Frame.RequestFailed');
 }
 
 /**

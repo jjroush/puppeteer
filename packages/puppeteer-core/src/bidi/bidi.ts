@@ -25,7 +25,6 @@ export * from './HTTPRequest.js';
 export * from './HTTPResponse.js';
 export * from './Input.js';
 export * from './JSHandle.js';
-export * from './NetworkManager.js';
 export * from './Page.js';
 export * from './Realm.js';
 export * from './Sandbox.js';

@@ -140,7 +140,9 @@ export class BrowsingContext extends EventEmitter<{
             return;
           }
           this.#url = info.url;
-          this.#navigation = new Navigation(this, info.navigation, info.url);
+          this.#requests.clear();
+          // Note the navigation ID is null for this event.
+          this.#navigation = new Navigation(this, info.url);
           this.emit('navigation', this.#navigation);
         }
       )
@@ -154,11 +156,13 @@ export class BrowsingContext extends EventEmitter<{
           if (event.context !== this.id) {
             return;
           }
-          if (event.navigation) {
-            return;
+          const request = new BidiRequest(this, event);
+          const original = this.#requests.get(request.id);
+          if (original) {
+            // TODO: Handle redirects.
+          } else {
+            this.#requests.set(request.id, request);
           }
-          const request = new BidiRequest(this, undefined, event);
-          this.#requests.set(request.id, request);
           this.emit('request', request);
         }
       )
@@ -199,6 +203,10 @@ export class BrowsingContext extends EventEmitter<{
 
   get cdpSession(): BidiCdpSession {
     return this.#cdpSession;
+  }
+
+  get requests(): Iterable<BidiRequest> {
+    return this.#requests.values();
   }
 
   get #connection(): BidiConnection {

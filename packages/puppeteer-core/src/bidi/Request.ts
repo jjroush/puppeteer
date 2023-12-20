@@ -1,54 +1,67 @@
 import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
-import {EventEmitter, EventSubscription} from '../common/EventEmitter.js';
-import {DisposableStack} from '../util/disposable.js';
+import {Deferred} from '../util/Deferred.js';
 
 import type {BrowsingContext} from './BrowsingContext.js';
-import type {Navigation} from './Navigation.js';
 
-export class BidiRequest extends EventEmitter<{
-  response: undefined;
-  error: undefined;
-}> {
+export class BidiRequest {
   readonly #context: BrowsingContext;
-  readonly #navigation: Navigation | undefined;
   readonly #event: Bidi.Network.BeforeRequestSentParameters;
-
-  #disposables = new DisposableStack();
+  readonly #response = new Deferred<Bidi.Network.ResponseData>();
 
   constructor(
     context: BrowsingContext,
-    navigation: Navigation | undefined,
     event: Bidi.Network.BeforeRequestSentParameters
   ) {
-    super();
     this.#context = context;
-    this.#navigation = navigation;
     this.#event = event;
 
     const connection = this.#context.browserContext.browser().connection;
-    this.#disposables.use(
-      new EventSubscription(
-        connection,
-        'network.responseCompleted',
-        (event: Bidi.Network.ResponseCompletedParameters) => {
-          if (
-            event.context !== this.#context.id ||
-            info.navigation !== this.#id
-          ) {
-            return;
-          }
-          this.#url = info.url;
-          this.emit(event, {
-            url: this.#url,
-            timestamp: new Date(info.timestamp),
-          });
-        }
-      )
+    connection.onceIf(
+      'network.responseCompleted',
+      event => {
+        return event.request.request === this.id;
+      },
+      event => {
+        this.#response.resolve(event.response);
+      }
+    );
+    connection.onceIf(
+      'network.fetchError',
+      event => {
+        return event.request.request === this.id;
+      },
+      event => {
+        this.#response.reject(new Error(event.errorText));
+      }
     );
   }
 
   get id(): string {
     return this.#event.request.request;
+  }
+
+  get url(): string {
+    return this.#event.request.url;
+  }
+
+  get initiator(): Bidi.Network.Initiator {
+    return this.#event.initiator;
+  }
+
+  get method(): string {
+    return this.#event.request.method;
+  }
+
+  get headers(): Bidi.Network.Header[] {
+    return this.#event.request.headers;
+  }
+
+  get navigation(): string | undefined {
+    return this.#event.navigation ?? undefined;
+  }
+
+  response(): Deferred<Bidi.Network.ResponseData> {
+    return this.#response;
   }
 }

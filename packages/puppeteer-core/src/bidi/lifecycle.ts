@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
 import type {
   ObservableInput,
@@ -21,80 +20,7 @@ import type {
   OperatorFunction,
 } from '../../third_party/rxjs/rxjs.js';
 import {catchError} from '../../third_party/rxjs/rxjs.js';
-import type {PuppeteerLifeCycleEvent} from '../cdp/LifecycleWatcher.js';
 import {ProtocolError, TimeoutError} from '../common/Errors.js';
-
-/**
- * @internal
- */
-export type BiDiNetworkIdle = Extract<
-  PuppeteerLifeCycleEvent,
-  'networkidle0' | 'networkidle2'
-> | null;
-
-/**
- * @internal
- */
-export function getBiDiLifeCycles(
-  event: PuppeteerLifeCycleEvent | PuppeteerLifeCycleEvent[]
-): [
-  Extract<PuppeteerLifeCycleEvent, 'load' | 'domcontentloaded'>,
-  BiDiNetworkIdle,
-] {
-  if (!Array.isArray(event)) {
-    event = [event];
-  }
-
-  const pageLifeCycle = event.some(lifeCycle => {
-    return lifeCycle !== 'domcontentloaded';
-  })
-    ? 'load'
-    : 'domcontentloaded';
-
-  const networkLifeCycle = event.reduce((acc, lifeCycle) => {
-    if (lifeCycle === 'networkidle0') {
-      return lifeCycle;
-    } else if (acc !== 'networkidle0' && lifeCycle === 'networkidle2') {
-      return lifeCycle;
-    }
-    return acc;
-  }, null as BiDiNetworkIdle);
-
-  return [pageLifeCycle, networkLifeCycle];
-}
-
-/**
- * @internal
- */
-export const lifeCycleToReadinessState = new Map<
-  PuppeteerLifeCycleEvent,
-  Bidi.BrowsingContext.ReadinessState
->([
-  ['load', Bidi.BrowsingContext.ReadinessState.Complete],
-  ['domcontentloaded', Bidi.BrowsingContext.ReadinessState.Interactive],
-]);
-
-/**
- * @internal
- */
-export const lifeCycleToSubscribedEvent = new Map<
-  PuppeteerLifeCycleEvent,
-  'browsingContext.load' | 'browsingContext.domContentLoaded'
->([
-  ['load', 'browsingContext.load'],
-  ['domcontentloaded', 'browsingContext.domContentLoaded'],
-]);
-
-/**
- * @internal
- */
-export function getBiDiLifecycleEvent(
-  event: PuppeteerLifeCycleEvent | PuppeteerLifeCycleEvent[]
-): ['load' | 'dom', number] {
-  const lifeCycles = getBiDiLifeCycles(event);
-  const bidiEvent = lifeCycleToSubscribedEvent.get(lifeCycles[0])!;
-  return [bidiEvent, lifeCycles[1]];
-}
 
 /**
  * @internal

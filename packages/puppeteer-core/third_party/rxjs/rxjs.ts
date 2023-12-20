@@ -16,7 +16,9 @@
 export {
   bufferCount,
   catchError,
+  concat,
   concatMap,
+  debounceTime,
   defaultIfEmpty,
   defer,
   delay,
@@ -35,6 +37,7 @@ export {
   mergeMap,
   NEVER,
   noop,
+  Observable,
   of,
   pipe,
   race,
@@ -46,6 +49,7 @@ export {
   tap,
   throwIfEmpty,
   timer,
+  zip,
 } from 'rxjs';
 
 export type * from 'rxjs';

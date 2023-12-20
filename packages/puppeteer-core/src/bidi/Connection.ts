@@ -23,8 +23,6 @@ import {EventEmitter} from '../common/EventEmitter.js';
 import {debugError} from '../common/util.js';
 import {assert} from '../util/assert.js';
 
-import {cdpSessions} from './BrowsingContext.js';
-
 const debugProtocolSend = debug('puppeteer:webDriverBiDi:SEND ►');
 const debugProtocolReceive = debug('puppeteer:webDriverBiDi:RECV ◀');
 

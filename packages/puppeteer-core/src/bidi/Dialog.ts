@@ -26,28 +26,19 @@ import type {BrowsingContext} from './BrowsingContext.js';
 export class BidiDialog extends Dialog {
   #context: BrowsingContext;
 
-  /**
-   * @internal
-   */
   constructor(
     context: BrowsingContext,
-    type: Bidi.BrowsingContext.UserPromptOpenedParameters['type'],
-    message: string,
-    defaultValue?: string
+    info: Bidi.BrowsingContext.UserPromptOpenedParameters
   ) {
-    super(type, message, defaultValue);
+    super(info.type, info.message, info.defaultValue);
     this.#context = context;
   }
 
-  /**
-   * @internal
-   */
-  override async sendCommand(options: {
+  override async handle(options: {
     accept: boolean;
     text?: string;
   }): Promise<void> {
-    await this.#context.connection.send('browsingContext.handleUserPrompt', {
-      context: this.#context.id,
+    await this.#context.handleUserPrompt({
       accept: options.accept,
       userText: options.text,
     });

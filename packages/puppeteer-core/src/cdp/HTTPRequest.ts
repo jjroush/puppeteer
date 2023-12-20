@@ -38,8 +38,9 @@ import type {CdpHTTPResponse} from './HTTPResponse.js';
  * @internal
  */
 export class CdpHTTPRequest extends HTTPRequest {
-  declare _redirectChain: CdpHTTPRequest[];
-  declare _response: CdpHTTPResponse | null;
+  _redirectChain: CdpHTTPRequest[] = [];
+  _response: CdpHTTPResponse | null = null;
+  _failureText: string | null = null;
 
   #client: CDPSession;
   #isNavigationRequest: boolean;

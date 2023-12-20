@@ -55,6 +55,7 @@ import {
   getReadableFromProtocolStream,
   NETWORK_IDLE_TIME,
   pageBindingInitString,
+  parsePDFOptions,
   timeout,
   validateDialogType,
   valueFromRemoteObject,
@@ -1146,7 +1147,7 @@ export class CdpPage extends Page {
       omitBackground,
       timeout: ms,
       tagged: generateTaggedPDF,
-    } = this._getPDFOptions(options);
+    } = parsePDFOptions(options);
 
     if (omitBackground) {
       await this.#emulationManager.setTransparentBackgroundColor();

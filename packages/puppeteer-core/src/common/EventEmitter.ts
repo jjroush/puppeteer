@@ -182,6 +182,32 @@ export class EventEmitter<Events extends Record<EventType, unknown>>
   }
 
   /**
+   * Like `on` but the listener will only be fired once if the given predicate
+   * is satisfied and then it will be removed.
+   *
+   * @param type - the event you'd like to listen to
+   * @param predicate - The predicate to use.
+   * @param handler - the handler function to run when the event occurs
+   * @returns `this` to enable you to chain method calls.
+   */
+  onceIf<Key extends keyof EventsWithWildcard<Events>>(
+    type: Key,
+    predicate: (data: EventsWithWildcard<Events>[Key]) => boolean,
+    handler: Handler<EventsWithWildcard<Events>[Key]>
+  ): this {
+    const onceIfHandler: Handler<
+      EventsWithWildcard<Events>[Key]
+    > = eventData => {
+      if (predicate(eventData)) {
+        handler(eventData);
+        this.off(type, onceIfHandler);
+      }
+    };
+
+    return this.on(type, onceIfHandler);
+  }
+
+  /**
    * Gets the number of listeners for a given event.
    *
    * @param type - the event to get the listener count for

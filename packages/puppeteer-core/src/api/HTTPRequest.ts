@@ -112,19 +112,7 @@ export abstract class HTTPRequest {
   /**
    * @internal
    */
-  _failureText: string | null = null;
-  /**
-   * @internal
-   */
-  _response: HTTPResponse | null = null;
-  /**
-   * @internal
-   */
   _fromMemoryCache = false;
-  /**
-   * @internal
-   */
-  _redirectChain: HTTPRequest[] = [];
 
   /**
    * Warning! Using this client can break Puppeteer. Use with caution.

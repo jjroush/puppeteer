@@ -1,10 +1,11 @@
 import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
 import {EventEmitter, EventSubscription} from '../common/EventEmitter.js';
+import {Deferred} from '../util/Deferred.js';
 import {DisposableStack} from '../util/disposable.js';
 
 import type {BrowsingContext} from './BrowsingContext.js';
-import {BidiRequest} from './Request.js';
+import type {BidiRequest} from './Request.js';
 
 /**
  * @internal
@@ -25,16 +26,14 @@ export class Navigation extends EventEmitter<{
   aborted: NavigationInfo;
 }> {
   #context: BrowsingContext;
-  #id: string | null;
+  #id = new Deferred<string>();
   #url: string;
 
   #disposables = new DisposableStack();
-  #request?: BidiRequest;
 
-  constructor(context: BrowsingContext, id: string | null, url: string) {
+  constructor(context: BrowsingContext, url: string) {
     super();
     this.#context = context;
-    this.#id = id;
     this.#url = url;
 
     const connection = this.#context.browserContext.browser().connection;
@@ -49,10 +48,16 @@ export class Navigation extends EventEmitter<{
           connection,
           bidiEvent,
           (info: Bidi.BrowsingContext.NavigationInfo) => {
-            if (
-              info.context !== this.#context.id ||
-              info.navigation !== this.#id
-            ) {
+            if (info.context !== this.#context.id) {
+              return;
+            }
+            if (!info.navigation) {
+              return;
+            }
+            if (!this.#id.resolved()) {
+              this.#id.resolve(info.navigation);
+            }
+            if (this.#id.value() !== info.navigation) {
               return;
             }
             this.#url = info.url;
@@ -64,29 +69,20 @@ export class Navigation extends EventEmitter<{
         )
       );
     }
-
-    this.#disposables.use(
-      new EventSubscription(
-        connection,
-        'network.beforeRequestSent',
-        (event: Bidi.Network.BeforeRequestSentParameters) => {
-          if (event.context !== this.#context.id) {
-            return;
-          }
-          if (event.navigation !== this.#id) {
-            return;
-          }
-          this.#request = new BidiRequest(this.#context, this, event);
-        }
-      )
-    );
   }
 
   get url(): string {
     return this.#url;
   }
 
-  get request(): BidiRequest | undefined {
-    return this.#request;
+  async request(): Promise<BidiRequest | undefined> {
+    // SAFETY: This will never throw.
+    const id = (await this.#id.valueOrThrow()) as string;
+    for (const request of this.#context.requests) {
+      if (request.navigation === id) {
+        return request;
+      }
+    }
+    return;
   }
 }
