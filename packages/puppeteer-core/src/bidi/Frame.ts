@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
 import type {Observable} from '../../third_party/rxjs/rxjs.js';
 import {
@@ -48,6 +49,11 @@ import type {
   WaitTimeoutOptions,
 } from '../api/Page.js';
 import {PageEvent, type WaitForSelectorOptions} from '../api/Page.js';
+import type {
+  ConsoleMessageLocation,
+  ConsoleMessageType,
+} from '../common/ConsoleMessage.js';
+import {ConsoleMessage} from '../common/ConsoleMessage.js';
 import {UnsupportedOperation} from '../common/Errors.js';
 import {EventSubscription} from '../common/EventEmitter.js';
 import type {PDFOptions} from '../common/PDFOptions.js';
@@ -55,6 +61,7 @@ import type {TimeoutSettings} from '../common/TimeoutSettings.js';
 import type {Awaitable, NodeFor} from '../common/types.js';
 import {
   NETWORK_IDLE_TIME,
+  debugError,
   fromEmitterEvent,
   importFSPromises,
   parsePDFOptions,
@@ -65,12 +72,15 @@ import {DisposableStack} from '../util/disposable.js';
 import {BidiCdpSession} from './BidiCdpSession.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
 import type {BrowsingContext} from './BrowsingContext.js';
+import {BidiDeserializer} from './Deserializer.js';
+import type {BidiDialog} from './Dialog.js';
 import {BidiElementHandle} from './ElementHandle.js';
 import {ExposeableFunction} from './ExposedFunction.js';
 import {BidiHTTPRequest} from './HTTPRequest.js';
 import type {BidiHTTPResponse} from './HTTPResponse.js';
 import type {Navigation} from './Navigation.js';
 import type {BidiPage} from './Page.js';
+import {createBidiHandle} from './Realm.js';
 import type {BidiRequest} from './Request.js';
 import type {Sandbox} from './Sandbox.js';
 
@@ -161,7 +171,7 @@ export class BidiFrame extends Frame {
           }
           this.#disposables.dispose();
           this.emit(FrameEvent.FrameDetached, this);
-          this.page().emit(PageEvent.FrameDetached, this);
+          this.#page.emit(PageEvent.FrameDetached, this);
           this.removeAllListeners();
         }
       )
@@ -176,9 +186,89 @@ export class BidiFrame extends Frame {
           this.#requests.set(request.id, httpRequest);
 
           this.bubbleEmit(FrameEvent.Request, httpRequest);
-          this.page().emit(PageEvent.Request, httpRequest);
+          this.#page.emit(PageEvent.Request, httpRequest);
         }
       )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#context,
+        'navigation',
+        (navigation: Navigation) => {
+          navigation.once('dom', () => {
+            this.#page.emit(PageEvent.DOMContentLoaded, undefined);
+            this.#page.emit(PageEvent.FrameNavigated, this);
+          });
+          navigation.once('loaded', () => {
+            this.#page.emit(PageEvent.Load, undefined);
+          });
+        }
+      )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(this.#context, 'dialog', (dialog: BidiDialog) => {
+        this.#page.emit(PageEvent.Dialog, dialog);
+      })
+    );
+
+    this.#disposables.use(
+      new EventSubscription(this.#context, 'log', (event: Bidi.Log.Entry) => {
+        if (isConsoleLogEntry(event)) {
+          const args = event.args.map(arg => {
+            return createBidiHandle(this.mainRealm(), arg);
+          });
+
+          const text = args
+            .reduce((value, arg) => {
+              const parsedValue = arg.isPrimitiveValue
+                ? BidiDeserializer.deserialize(arg.remoteValue())
+                : arg.toString();
+              return `${value} ${parsedValue}`;
+            }, '')
+            .slice(1);
+
+          this.#page.emit(
+            PageEvent.Console,
+            new ConsoleMessage(
+              event.method as ConsoleMessageType,
+              text,
+              args,
+              getStackTraceLocations(event.stackTrace)
+            )
+          );
+        } else if (isJavaScriptLogEntry(event)) {
+          const error = new Error(event.text ?? '');
+
+          const messageHeight = error.message.split('\n').length;
+          const messageLines = error
+            .stack!.split('\n')
+            .splice(0, messageHeight);
+
+          const stackLines = [];
+          if (event.stackTrace) {
+            for (const frame of event.stackTrace.callFrames) {
+              // Note we need to add `1` because the values are 0-indexed.
+              stackLines.push(
+                `    at ${frame.functionName || '<anonymous>'} (${frame.url}:${
+                  frame.lineNumber + 1
+                }:${frame.columnNumber + 1})`
+              );
+              if (stackLines.length >= Error.stackTraceLimit) {
+                break;
+              }
+            }
+          }
+
+          error.stack = [...messageLines, ...stackLines].join('\n');
+          this.#page.emit(PageEvent.PageError, error);
+        } else {
+          debugError(
+            `Unhandled LogEntry with type "${event.type}", text "${event.text}" and level "${event.level}"`
+          );
+        }
+      })
     );
   }
 
@@ -623,4 +713,32 @@ export class BidiFrame extends Frame {
 
     return await super.waitForSelector(selector, options);
   }
+}
+
+function isConsoleLogEntry(
+  event: Bidi.Log.Entry
+): event is Bidi.Log.ConsoleLogEntry {
+  return event.type === 'console';
+}
+
+function isJavaScriptLogEntry(
+  event: Bidi.Log.Entry
+): event is Bidi.Log.JavascriptLogEntry {
+  return event.type === 'javascript';
+}
+
+function getStackTraceLocations(
+  stackTrace?: Bidi.Script.StackTrace
+): ConsoleMessageLocation[] {
+  const stackTraceLocations: ConsoleMessageLocation[] = [];
+  if (stackTrace) {
+    for (const callFrame of stackTrace.callFrames) {
+      stackTraceLocations.push({
+        url: callFrame.url,
+        lineNumber: callFrame.lineNumber,
+        columnNumber: callFrame.columnNumber,
+      });
+    }
+  }
+  return stackTraceLocations;
 }

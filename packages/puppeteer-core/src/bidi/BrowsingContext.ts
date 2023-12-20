@@ -7,6 +7,7 @@ import {DisposableStack} from '../util/disposable.js';
 import {BidiCdpSession} from './BidiCdpSession.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
 import type {BidiConnection} from './Connection.js';
+import {BidiDialog} from './Dialog.js';
 import {Navigation} from './Navigation.js';
 import {BidiRequest} from './Request.js';
 
@@ -42,6 +43,10 @@ export class BrowsingContext extends EventEmitter<{
   navigation: Navigation;
   // Emitted whenever a request is made.
   request: BidiRequest;
+  // Emitted whenever the context logs something.
+  log: Bidi.Log.Entry;
+  // Emitted whenever a prompt is opened.
+  dialog: BidiDialog;
 }> {
   static createTopContext(
     browserContext: BidiBrowserContext,
@@ -52,7 +57,7 @@ export class BrowsingContext extends EventEmitter<{
   }
 
   readonly #browserContext: BidiBrowserContext;
-  readonly #parent: BrowsingContext | undefined;
+  readonly parent: BrowsingContext | undefined;
   readonly id: string;
   #url: string;
 
@@ -76,7 +81,7 @@ export class BrowsingContext extends EventEmitter<{
     super();
 
     this.#browserContext = browserContext;
-    this.#parent = parent;
+    this.parent = parent;
     this.id = id;
     this.#url = url;
 
@@ -167,14 +172,37 @@ export class BrowsingContext extends EventEmitter<{
         }
       )
     );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'log.entryAdded',
+        (entry: Bidi.Log.Entry) => {
+          if (entry.source.context !== this.id) {
+            return;
+          }
+          this.emit('log', entry);
+        }
+      )
+    );
+
+    this.#disposables.use(
+      new EventSubscription(
+        this.#connection,
+        'browsingContext.userPromptOpened',
+        (info: Bidi.BrowsingContext.UserPromptOpenedParameters) => {
+          if (info.context !== this.id) {
+            return;
+          }
+          const dialog = new BidiDialog(this, info);
+          this.emit('dialog', dialog);
+        }
+      )
+    );
   }
 
   get disposed(): boolean {
     return this.#disposables.disposed;
-  }
-
-  get parent(): BrowsingContext | undefined {
-    return this.#parent;
   }
 
   get children(): Iterable<BrowsingContext> {

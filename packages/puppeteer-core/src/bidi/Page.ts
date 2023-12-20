@@ -16,7 +16,6 @@
 
 import type {Readable} from 'stream';
 
-import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 import type Protocol from 'devtools-protocol';
 
 import type {CDPSession} from '../api/CDPSession.js';
@@ -37,7 +36,6 @@ import {Accessibility} from '../cdp/Accessibility.js';
 import {Coverage} from '../cdp/Coverage.js';
 import {EmulationManager as CdpEmulationManager} from '../cdp/EmulationManager.js';
 import {Tracing} from '../cdp/Tracing.js';
-import type {ConsoleMessageLocation} from '../common/ConsoleMessage.js';
 import {UnsupportedOperation} from '../common/Errors.js';
 import {EventSubscription} from '../common/EventEmitter.js';
 import type {PDFOptions} from '../common/PDFOptions.js';
@@ -488,34 +486,6 @@ export class BidiPage extends Page {
   override waitForDevicePrompt(): never {
     throw new UnsupportedOperation();
   }
-}
-
-function isConsoleLogEntry(
-  event: Bidi.Log.Entry
-): event is Bidi.Log.ConsoleLogEntry {
-  return event.type === 'console';
-}
-
-function isJavaScriptLogEntry(
-  event: Bidi.Log.Entry
-): event is Bidi.Log.JavascriptLogEntry {
-  return event.type === 'javascript';
-}
-
-function getStackTraceLocations(
-  stackTrace?: Bidi.Script.StackTrace
-): ConsoleMessageLocation[] {
-  const stackTraceLocations: ConsoleMessageLocation[] = [];
-  if (stackTrace) {
-    for (const callFrame of stackTrace.callFrames) {
-      stackTraceLocations.push({
-        url: callFrame.url,
-        lineNumber: callFrame.lineNumber,
-        columnNumber: callFrame.columnNumber,
-      });
-    }
-  }
-  return stackTraceLocations;
 }
 
 function evaluationExpression(fun: Function | string, ...args: unknown[]) {
