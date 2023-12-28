@@ -1,20 +1,20 @@
 import * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
-import {EventEmitter, type EventType} from '../common/EventEmitter.js';
+import {Realm} from '../api/Realm.js';
 import {scriptInjector} from '../common/ScriptInjector.js';
+import type {TimeoutSettings} from '../common/TimeoutSettings.js';
 import type {EvaluateFunc, HandleFor} from '../common/types.js';
 import {
-  PuppeteerURL,
-  SOURCE_URL_REGEX,
   getSourcePuppeteerURLIfAvailable,
   getSourceUrlComment,
   isString,
+  PuppeteerURL,
+  SOURCE_URL_REGEX,
 } from '../common/util.js';
 import type PuppeteerUtil from '../injected/injected.js';
-import {disposeSymbol} from '../util/disposable.js';
 import {stringifyFunction} from '../util/Function.js';
 
-import type {BidiConnection} from './Connection.js';
+import type {BidiBidiRealm} from './BidiRealm.js';
 import {BidiDeserializer} from './Deserializer.js';
 import {BidiElementHandle} from './ElementHandle.js';
 import {BidiJSHandle} from './JSHandle.js';
@@ -25,56 +25,15 @@ import {createEvaluationError} from './util.js';
 /**
  * @internal
  */
-export class BidiRealm extends EventEmitter<Record<EventType, any>> {
-  readonly connection: BidiConnection;
+export class BidiRealm<RealmInfo extends Bidi.Script.RealmInfo> extends Realm {
+  #realm: BidiBidiRealm<RealmInfo>;
 
-  #id!: string;
-  #sandbox!: Sandbox;
-
-  constructor(connection: BidiConnection) {
-    super();
-    this.connection = connection;
-  }
-
-  get target(): Bidi.Script.Target {
-    return {
-      context: this.#sandbox.environment._id,
-      sandbox: this.#sandbox.name,
-    };
-  }
-
-  handleRealmDestroyed = async (
-    params: Bidi.Script.RealmDestroyed['params']
-  ): Promise<void> => {
-    if (params.realm === this.#id) {
-      // Note: The Realm is destroyed, so in theory the handle should be as
-      // well.
-      this.internalPuppeteerUtil = undefined;
-      this.#sandbox.environment.clearDocumentHandle();
-    }
-  };
-
-  handleRealmCreated = (params: Bidi.Script.RealmCreated['params']): void => {
-    if (
-      params.type === 'window' &&
-      params.context === this.#sandbox.environment._id &&
-      params.sandbox === this.#sandbox.name
-    ) {
-      this.#id = params.realm;
-      void this.#sandbox.taskManager.rerunAll();
-    }
-  };
-
-  setSandbox(sandbox: Sandbox): void {
-    this.#sandbox = sandbox;
-    this.connection.on(
-      Bidi.ChromiumBidi.Script.EventNames.RealmCreated,
-      this.handleRealmCreated
-    );
-    this.connection.on(
-      Bidi.ChromiumBidi.Script.EventNames.RealmDestroyed,
-      this.handleRealmDestroyed
-    );
+  constructor(
+    realm: BidiBidiRealm<RealmInfo>,
+    timeoutSettings: TimeoutSettings
+  ) {
+    super(timeoutSettings);
+    this.#realm = realm;
   }
 
   protected internalPuppeteerUtil?: Promise<BidiJSHandle<PuppeteerUtil>>;
@@ -144,8 +103,6 @@ export class BidiRealm extends EventEmitter<Record<EventType, any>> {
         PuppeteerURL.INTERNAL_URL
     );
 
-    const sandbox = this.#sandbox;
-
     let responsePromise;
     const resultOwnership = returnByValue
       ? Bidi.Script.ResultOwnership.None
@@ -174,18 +131,15 @@ export class BidiRealm extends EventEmitter<Record<EventType, any>> {
       functionDeclaration = SOURCE_URL_REGEX.test(functionDeclaration)
         ? functionDeclaration
         : `${functionDeclaration}\n${sourceUrlComment}\n`;
-      responsePromise = this.connection.send('script.callFunction', {
-        functionDeclaration,
+      responsePromise = this.#realm.callFunction(functionDeclaration, true, {
         arguments: args.length
           ? await Promise.all(
               args.map(arg => {
-                return BidiSerializer.serialize(sandbox, arg);
+                return BidiSerializer.serialize(this.#realm.frame(), arg);
               })
             )
           : [],
-        target: this.target,
         resultOwnership,
-        awaitPromise: true,
         userActivation: true,
         serializationOptions,
       });
@@ -199,18 +153,7 @@ export class BidiRealm extends EventEmitter<Record<EventType, any>> {
 
     return returnByValue
       ? BidiDeserializer.deserialize(result.result)
-      : createBidiHandle(sandbox, result.result);
-  }
-
-  [disposeSymbol](): void {
-    this.connection.off(
-      Bidi.ChromiumBidi.Script.EventNames.RealmCreated,
-      this.handleRealmCreated
-    );
-    this.connection.off(
-      Bidi.ChromiumBidi.Script.EventNames.RealmDestroyed,
-      this.handleRealmDestroyed
-    );
+      : createBidiHandle(this, result.result);
   }
 }
 

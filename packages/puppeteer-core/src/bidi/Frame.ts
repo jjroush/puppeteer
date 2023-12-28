@@ -73,15 +73,15 @@ import {BidiCdpSession} from './BidiCdpSession.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
 import type {BrowsingContext} from './BrowsingContext.js';
 import {BidiDeserializer} from './Deserializer.js';
-import type {BidiDialog} from './Dialog.js';
+import type {UserPrompt} from './core/UserPrompt.js';
 import {BidiElementHandle} from './ElementHandle.js';
 import {ExposeableFunction} from './ExposedFunction.js';
 import {BidiHTTPRequest} from './HTTPRequest.js';
 import type {BidiHTTPResponse} from './HTTPResponse.js';
-import type {Navigation} from './Navigation.js';
+import type {Navigation} from './core/Navigation.js';
 import type {BidiPage} from './Page.js';
 import {createBidiHandle} from './Realm.js';
-import type {BidiRequest} from './Request.js';
+import type {BidiRequest} from './core/Request.js';
 import type {Sandbox} from './Sandbox.js';
 
 /**
@@ -208,7 +208,7 @@ export class BidiFrame extends Frame {
     );
 
     this.#disposables.use(
-      new EventSubscription(this.#context, 'dialog', (dialog: BidiDialog) => {
+      new EventSubscription(this.#context, 'dialog', (dialog: UserPrompt) => {
         this.#page.emit(PageEvent.Dialog, dialog);
       })
     );
@@ -546,7 +546,7 @@ export class BidiFrame extends Frame {
       timeout: ms = this.#timeoutSettings.timeout(),
     } = options;
 
-    const idle$ = concat(
+    const idle$ = merge(
       of(null),
       fromEmitterEvent(this, PageEvent.Request),
       fromEmitterEvent(this, PageEvent.RequestFinished),
@@ -566,6 +566,15 @@ export class BidiFrame extends Frame {
         )
       )
     );
+  }
+
+  @throwIfDetached
+  async go(
+    delta: number,
+    options?: WaitForOptions
+  ): Promise<HTTPResponse | null> {
+    void this.#context.traverseHistory(delta);
+    return await this.waitForNavigation(options);
   }
 
   override mainRealm(): Sandbox {

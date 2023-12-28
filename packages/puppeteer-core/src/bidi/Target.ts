@@ -20,7 +20,7 @@ import {UnsupportedOperation} from '../common/Errors.js';
 
 import type {BidiBrowser} from './Browser.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
-import {type BrowsingContext, CdpSessionWrapper} from './BrowsingContext.js';
+import type {BrowsingContext} from './BrowsingContext.js';
 import {BidiPage} from './Page.js';
 
 /**

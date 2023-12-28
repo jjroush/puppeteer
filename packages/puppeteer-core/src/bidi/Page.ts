@@ -44,7 +44,6 @@ import {evaluationString} from '../common/util.js';
 import type {Viewport} from '../common/Viewport.js';
 import {assert} from '../util/assert.js';
 import {DisposableStack} from '../util/disposable.js';
-import {isErrorLike} from '../util/ErrorLike.js';
 
 import type {BidiBrowser} from './Browser.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
@@ -453,34 +452,13 @@ export class BidiPage extends Page {
   override async goBack(
     options?: WaitForOptions
   ): Promise<HTTPResponse | null> {
-    return await this.#go(-1, options);
+    return await this.#frame.go(-1, options);
   }
 
   override async goForward(
     options?: WaitForOptions
   ): Promise<HTTPResponse | null> {
-    return await this.#go(+1, options);
-  }
-
-  async #go(
-    delta: number,
-    options?: WaitForOptions
-  ): Promise<HTTPResponse | null> {
-    try {
-      const result = await Promise.all([
-        this.waitForNavigation(options),
-        this.#frame.context().traverseHistory(delta),
-      ]);
-      return result[0];
-    } catch (err) {
-      // TODO: waitForNavigation should be cancelled if an error happens.
-      if (isErrorLike(err)) {
-        if (err.message.includes('no such history entry')) {
-          return null;
-        }
-      }
-      throw err;
-    }
+    return await this.#frame.go(+1, options);
   }
 
   override waitForDevicePrompt(): never {

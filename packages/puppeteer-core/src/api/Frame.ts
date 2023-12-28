@@ -53,7 +53,7 @@ import {
   NodeLocator,
 } from './locators/locators.js';
 import type {Realm} from './Realm.js';
-import {HTTPRequest} from './HTTPRequest.js';
+import type {HTTPRequest} from './HTTPRequest.js';
 
 /**
  * @public

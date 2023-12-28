@@ -1,8 +1,8 @@
 import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
-import {EventEmitter, EventSubscription} from '../common/EventEmitter.js';
-import {Deferred} from '../util/Deferred.js';
-import {DisposableStack} from '../util/disposable.js';
+import {EventEmitter, EventSubscription} from '../../common/EventEmitter.js';
+import {Deferred} from '../../util/Deferred.js';
+import {DisposableStack} from '../../util/disposable.js';
 
 import type {BrowsingContext} from './BrowsingContext.js';
 import type {BidiRequest} from './Request.js';
@@ -10,11 +10,11 @@ import type {BidiRequest} from './Request.js';
 /**
  * @internal
  */
-
 export interface NavigationInfo {
   url: string;
   timestamp: Date;
 }
+
 /**
  * @internal
  */
@@ -36,7 +36,7 @@ export class Navigation extends EventEmitter<{
     this.#context = context;
     this.#url = url;
 
-    const connection = this.#context.browserContext.browser().connection;
+    const connection = this.#context.context.browser.session.connection;
     for (const [bidiEvent, event] of [
       ['browsingContext.domContentLoaded', 'dom'],
       ['browsingContext.load', 'loaded'],
@@ -76,8 +76,7 @@ export class Navigation extends EventEmitter<{
   }
 
   async request(): Promise<BidiRequest | undefined> {
-    // SAFETY: This will never throw.
-    const id = (await this.#id.valueOrThrow()) as string;
+    const id = await this.#id.valueOrThrow();
     for (const request of this.#context.requests) {
       if (request.navigation === id) {
         return request;

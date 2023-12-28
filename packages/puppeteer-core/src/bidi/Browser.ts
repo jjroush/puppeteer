@@ -31,15 +31,17 @@ import type {Viewport} from '../common/Viewport.js';
 
 import {BidiBrowserContext} from './BrowserContext.js';
 import type {BidiConnection} from './Connection.js';
+import {Browser as BrowserCore} from './core/Browser.js';
+import {Session} from './core/Session.js';
+import {Connection} from './core/Connection.js';
 
 /**
  * @internal
  */
 export interface BidiBrowserOptions {
-  process?: ChildProcess;
   closeCallback?: BrowserCloseCallback;
-  connection: BidiConnection;
-  defaultViewport: Viewport | null;
+  defaultViewport?: Viewport;
+  process?: ChildProcess;
   ignoreHTTPSErrors?: boolean;
 }
 
@@ -69,36 +71,24 @@ export class BidiBrowser extends Browser {
     'cdp.Page.screencastFrame',
   ];
 
-  static async create(opts: BidiBrowserOptions): Promise<BidiBrowser> {
-    let browserName = '';
-    let browserVersion = '';
+  static async create(
+    connection: Connection,
+    options: BidiBrowserOptions
+  ): Promise<BidiBrowser> {
+    const {ignoreHTTPSErrors} = options;
 
-    // TODO: await until the connection is established.
-    try {
-      const {result} = await opts.connection.send('session.new', {
-        capabilities: {
-          alwaysMatch: {
-            acceptInsecureCerts: opts.ignoreHTTPSErrors,
-          },
-        },
-      });
-      browserName = result.capabilities.browserName ?? '';
-      browserVersion = result.capabilities.browserVersion ?? '';
-    } catch (err) {
-      // Chrome does not support session.new.
-      debugError(err);
-    }
+    const session = await Session.create(connection, {
+      alwaysMatch: {
+        acceptInsecureCerts: ignoreHTTPSErrors,
+      },
+    });
+    const bidiBrowser = new BrowserCore(session);
+    const browser = new BidiBrowser(bidiBrowser);
 
     await opts.connection.send('session.subscribe', {
       events: browserName.toLocaleLowerCase().includes('firefox')
         ? BidiBrowser.subscribeModules
         : [...BidiBrowser.subscribeModules, ...BidiBrowser.subscribeCdpEvents],
-    });
-
-    const browser = new BidiBrowser({
-      ...opts,
-      browserName,
-      browserVersion,
     });
 
     // Emit the contexts.
@@ -114,31 +104,27 @@ export class BidiBrowser extends Browser {
     return browser;
   }
 
-  #browserName: string;
-  #browserVersion: string;
+  #browser: BrowserCore;
   #process?: ChildProcess;
   #closeCallback?: BrowserCloseCallback;
-  #connection: BidiConnection;
-  #defaultViewport: Viewport | null;
+  #defaultViewport?: Viewport;
   #contexts: [BidiBrowserContext, ...BidiBrowserContext[]];
 
   constructor(
-    opts: BidiBrowserOptions & {
-      browserName: string;
-      browserVersion: string;
-    }
+    browser: BrowserCore,
+    closeCallback?: BrowserCloseCallback,
+    defaultViewport?: Viewport,
+    process?: ChildProcess
   ) {
     super();
-    this.#process = opts.process;
-    this.#closeCallback = opts.closeCallback;
-    this.#connection = opts.connection;
-    this.#defaultViewport = opts.defaultViewport;
-    this.#browserName = opts.browserName;
-    this.#browserVersion = opts.browserVersion;
+    this.#browser = browser;
+    this.#process = process;
+    this.#closeCallback = closeCallback;
+    this.#defaultViewport = defaultViewport;
 
     this.#contexts = [
       new BidiBrowserContext(this, {
-        defaultViewport: this.#defaultViewport,
+        defaultViewport: this.#defaultViewport ?? null,
         isDefault: true,
       }),
     ];

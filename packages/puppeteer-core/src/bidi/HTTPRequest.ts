@@ -27,7 +27,7 @@ import {invokeAtMostOnceForArguments} from '../util/decorators.js';
 
 import type {BidiFrame} from './Frame.js';
 import {BidiHTTPResponse} from './HTTPResponse.js';
-import type {BidiRequest} from './Request.js';
+import type {BidiRequest} from './core/Request.js';
 
 /**
  * @internal

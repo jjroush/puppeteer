@@ -238,15 +238,18 @@ export class EventEmitter<Events extends Record<EventType, unknown>>
  * @internal
  */
 export class EventSubscription<
-  Target extends CommonEventEmitter<Record<Type, Event>>,
-  Type extends EventType = EventType,
-  Event = unknown,
+  Events extends Record<EventType, unknown>,
+  Event extends keyof Events,
 > {
-  #target: Target;
-  #type: Type;
-  #handler: Handler<Event>;
+  #target: EventEmitter<Events>;
+  #type: Event;
+  #handler: Handler<Events[Event]>;
 
-  constructor(target: Target, type: Type, handler: Handler<Event>) {
+  constructor(
+    target: EventEmitter<Events>,
+    type: Event,
+    handler: Handler<Events[Event]>
+  ) {
     this.#target = target;
     this.#type = type;
     this.#handler = handler;

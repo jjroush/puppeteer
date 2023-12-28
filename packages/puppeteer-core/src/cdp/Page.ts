@@ -1132,6 +1132,7 @@ export class CdpPage extends Page {
   }
 
   override async createPDFStream(options: PDFOptions = {}): Promise<Readable> {
+    const {timeout: ms = this._timeoutSettings.timeout()} = options;
     const {
       landscape,
       displayHeaderFooter,
@@ -1145,7 +1146,6 @@ export class CdpPage extends Page {
       pageRanges,
       preferCSSPageSize,
       omitBackground,
-      timeout: ms,
       tagged: generateTaggedPDF,
     } = parsePDFOptions(options);
 

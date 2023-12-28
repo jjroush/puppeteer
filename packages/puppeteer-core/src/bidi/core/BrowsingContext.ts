@@ -1,15 +1,13 @@
 import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
-import {EventEmitter, EventSubscription} from '../common/EventEmitter.js';
-import {throwIfDisposed} from '../util/decorators.js';
-import {DisposableStack} from '../util/disposable.js';
+import {EventEmitter, EventSubscription} from '../../common/EventEmitter.js';
+import {throwIfDisposed} from '../../util/decorators.js';
+import {DisposableStack} from '../../util/disposable.js';
 
-import {BidiCdpSession} from './BidiCdpSession.js';
-import type {BidiBrowserContext} from './BrowserContext.js';
-import type {BidiConnection} from './Connection.js';
-import {UserPrompt} from './core/UserPrompt.js';
-import {Navigation} from './core/Navigation.js';
-import {BidiRequest} from './core/Request.js';
+import {Navigation} from './Navigation.js';
+import {BidiRequest} from './Request.js';
+import type {UserContext} from './UserContext.js';
+import {UserPrompt} from './UserPrompt.js';
 
 export type CaptureScreenshotOptions = Omit<
   Bidi.BrowsingContext.CaptureScreenshotParameters,
@@ -46,57 +44,52 @@ export class BrowsingContext extends EventEmitter<{
   // Emitted whenever the context logs something.
   log: Bidi.Log.Entry;
   // Emitted whenever a prompt is opened.
-  dialog: UserPrompt;
+  userprompt: UserPrompt;
 }> {
-  static createTopContext(
-    browserContext: BidiBrowserContext,
+  static create(
+    context: UserContext,
     id: string,
     url: string
   ): BrowsingContext {
-    return new BrowsingContext(browserContext, undefined, id, url);
+    return new BrowsingContext(context, undefined, id, url);
   }
 
-  readonly #browserContext: BidiBrowserContext;
+  readonly context: UserContext;
   readonly parent: BrowsingContext | undefined;
   readonly id: string;
   #url: string;
 
   readonly #disposables = new DisposableStack();
   readonly #children = new Map<string, BrowsingContext>();
-
-  readonly #cdpSession: BidiCdpSession;
-
-  // Only a single navigation can occur at a time.
-  #navigation?: Navigation;
-
-  // A map of ongoing requests.
   readonly #requests = new Map<string, BidiRequest>();
 
+  #navigation?: Navigation;
+  #userPrompt?: UserPrompt;
+
   private constructor(
-    browserContext: BidiBrowserContext,
+    context: UserContext,
     parent: BrowsingContext | undefined,
     id: string,
     url: string
   ) {
     super();
 
-    this.#browserContext = browserContext;
+    this.context = context;
     this.parent = parent;
     this.id = id;
     this.#url = url;
 
-    this.#cdpSession = new BidiCdpSession(this);
-
+    const connection = this.#connection;
     this.#disposables.use(
       new EventSubscription(
-        this.#connection,
+        connection,
         'browsingContext.contextCreated',
-        (info: Bidi.BrowsingContext.Info) => {
+        info => {
           if (info.parent !== this.id) {
             return;
           }
           const context = new BrowsingContext(
-            this.#browserContext,
+            this.context,
             this,
             info.context,
             info.url
@@ -120,12 +113,11 @@ export class BrowsingContext extends EventEmitter<{
         }
       )
     );
-
     this.#disposables.use(
       new EventSubscription(
-        this.#connection,
+        connection,
         'browsingContext.contextDestroyed',
-        (info: Bidi.BrowsingContext.Info) => {
+        info => {
           if (info.context !== this.id) {
             return;
           }
@@ -135,12 +127,11 @@ export class BrowsingContext extends EventEmitter<{
         }
       )
     );
-
     this.#disposables.use(
       new EventSubscription(
-        this.#connection,
+        connection,
         'browsingContext.navigationStarted',
-        (info: Bidi.BrowsingContext.NavigationInfo) => {
+        info => {
           if (info.context !== this.id) {
             return;
           }
@@ -152,53 +143,45 @@ export class BrowsingContext extends EventEmitter<{
         }
       )
     );
-
     this.#disposables.use(
-      new EventSubscription(
-        this.#connection,
-        'network.beforeRequestSent',
-        (event: Bidi.Network.BeforeRequestSentParameters) => {
-          if (event.context !== this.id) {
-            return;
-          }
-          const request = new BidiRequest(this, event);
-          const original = this.#requests.get(request.id);
-          if (original) {
-            // TODO: Handle redirects.
-          } else {
-            this.#requests.set(request.id, request);
-          }
-          this.emit('request', request);
+      new EventSubscription(connection, 'network.beforeRequestSent', event => {
+        if (event.context !== this.id) {
+          return;
         }
-      )
-    );
-
-    this.#disposables.use(
-      new EventSubscription(
-        this.#connection,
-        'log.entryAdded',
-        (entry: Bidi.Log.Entry) => {
-          if (entry.source.context !== this.id) {
-            return;
-          }
-          this.emit('log', entry);
+        if (this.#requests.has(event.request.request)) {
+          return;
         }
-      )
+        const request = new BidiRequest(this, event);
+        this.#requests.set(request.id, request);
+        this.emit('request', request);
+      })
     );
-
+    this.#disposables.use(
+      new EventSubscription(connection, 'log.entryAdded', entry => {
+        if (entry.source.context !== this.id) {
+          return;
+        }
+        this.emit('log', entry);
+      })
+    );
     this.#disposables.use(
       new EventSubscription(
-        this.#connection,
+        connection,
         'browsingContext.userPromptOpened',
-        (info: Bidi.BrowsingContext.UserPromptOpenedParameters) => {
+        info => {
           if (info.context !== this.id) {
             return;
           }
-          const dialog = new UserPrompt(this, info);
-          this.emit('dialog', dialog);
+          const userPrompt = new UserPrompt(this, info);
+          this.#userPrompt = userPrompt;
+          this.emit('userprompt', this.#userPrompt);
         }
       )
     );
+  }
+
+  get #connection() {
+    return this.context.browser.session.connection;
   }
 
   get disposed(): boolean {
@@ -225,20 +208,12 @@ export class BrowsingContext extends EventEmitter<{
     return this.#navigation;
   }
 
-  get browserContext(): BidiBrowserContext {
-    return this.#browserContext;
-  }
-
-  get cdpSession(): BidiCdpSession {
-    return this.#cdpSession;
+  get userPrompt(): UserPrompt | undefined {
+    return this.#userPrompt;
   }
 
   get requests(): Iterable<BidiRequest> {
     return this.#requests.values();
-  }
-
-  get #connection(): BidiConnection {
-    return this.#browserContext.browser().connection;
   }
 
   @throwIfDisposed()

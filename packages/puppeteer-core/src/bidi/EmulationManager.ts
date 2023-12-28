@@ -28,18 +28,20 @@ export class EmulationManager {
   }
 
   async emulateViewport(viewport: Viewport): Promise<void> {
-    await this.#browsingContext.connection.send('browsingContext.setViewport', {
-      context: this.#browsingContext.id,
-      viewport:
-        viewport.width && viewport.height
-          ? {
-              width: viewport.width,
-              height: viewport.height,
-            }
+    await this.#browsingContext.browserContext
+      .browser()
+      .connection.send('browsingContext.setViewport', {
+        context: this.#browsingContext.id,
+        viewport:
+          viewport.width && viewport.height
+            ? {
+                width: viewport.width,
+                height: viewport.height,
+              }
+            : null,
+        devicePixelRatio: viewport.deviceScaleFactor
+          ? viewport.deviceScaleFactor
           : null,
-      devicePixelRatio: viewport.deviceScaleFactor
-        ? viewport.deviceScaleFactor
-        : null,
-    });
+      });
   }
 }
