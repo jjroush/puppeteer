@@ -6,7 +6,7 @@ import {DisposableStack} from '../../util/disposable.js';
 import type {BrowsingContext} from './BrowsingContext.js';
 
 export class BidiRequest extends EventEmitter<{
-  // Emitted whenever the request is redirected.
+  // Emitted whenever a redirect is received.
   redirect: BidiRequest;
   // Emitted when when the request succeeds.
   success: Bidi.Network.ResponseData;
@@ -16,10 +16,11 @@ export class BidiRequest extends EventEmitter<{
   readonly #context: BrowsingContext;
   readonly #event: Bidi.Network.BeforeRequestSentParameters;
 
-  readonly #response?: Bidi.Network.ResponseData;
   readonly #disposables = new DisposableStack();
 
+  #response?: Bidi.Network.ResponseData;
   #redirect?: BidiRequest;
+  #error?: string;
 
   constructor(
     context: BrowsingContext,
@@ -38,7 +39,8 @@ export class BidiRequest extends EventEmitter<{
         if (event.request.request !== this.id) {
           return;
         }
-        this.emit('success', event.response);
+        this.#response = event.response;
+        this.emit('success', this.#response);
       })
     );
     this.#disposables.use(
@@ -49,7 +51,8 @@ export class BidiRequest extends EventEmitter<{
         if (event.request.request !== this.id) {
           return;
         }
-        this.emit('error', event.errorText);
+        this.#error = event.errorText;
+        this.emit('error', this.#error);
       })
     );
     this.#disposables.use(
@@ -61,6 +64,8 @@ export class BidiRequest extends EventEmitter<{
           return;
         }
         if (this.#redirect) {
+          // XXX: Separate descendant redirect events?.
+          this.emit('redirect', this.#redirect);
           return;
         }
         this.#redirect = new BidiRequest(this.#context, event);
@@ -99,5 +104,9 @@ export class BidiRequest extends EventEmitter<{
 
   get response(): Bidi.Network.ResponseData | undefined {
     return this.#response;
+  }
+
+  get error(): string | undefined {
+    return this.#error;
   }
 }

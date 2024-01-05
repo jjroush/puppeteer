@@ -3,25 +3,41 @@ import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 import {EventEmitter} from '../../common/EventEmitter.js';
 import {throwIfDisposed} from '../../util/decorators.js';
 
+import {Browser} from './Browser.js';
 import type {Connection} from './Connection.js';
 
 export class Session extends EventEmitter<{
-  ended: undefined;
+  /**
+   * Emitted when the session has ended.
+   */
+  ended: {reason: string};
 }> {
-  readonly connection: Connection;
-  readonly #info: Bidi.Session.NewResult;
-
-  #ended = false;
-
   static async create(
     connection: Connection,
     capabilities: Bidi.Session.CapabilitiesRequest
   ): Promise<Session> {
+    // Wait until the connection is ready.
+    while (true) {
+      const {result: ready} = await connection.send('session.status', {});
+      if (ready) {
+        break;
+      }
+    }
+
     const {result} = await connection.send('session.new', {
       capabilities,
     });
-    return new Session(connection, result);
+    const session = new Session(connection, result);
+    await session.#initialize();
+    return session;
   }
+
+  readonly connection: Connection;
+  readonly browser = Browser.create(this);
+
+  readonly #info: Bidi.Session.NewResult;
+
+  #reason: string | undefined;
 
   constructor(connection: Connection, info: Bidi.Session.NewResult) {
     super();
@@ -29,28 +45,34 @@ export class Session extends EventEmitter<{
     this.#info = info;
   }
 
+  get disposed(): boolean {
+    return this.#reason !== undefined;
+  }
+
   get id(): string {
     return this.#info.sessionId;
   }
 
-  get browserName(): string {
-    return this.#info.capabilities.browserName;
+  get capabilities(): Bidi.Session.NewResult['capabilities'] {
+    return this.#info.capabilities;
   }
 
-  get browserVersion(): string {
-    return this.#info.capabilities.browserVersion;
-  }
-
-  get disposed(): boolean {
-    return this.#ended;
+  async #initialize(): Promise<void> {
+    this.browser.once('closed', ({reason}) => {
+      this.#reason = reason;
+      this.emit('ended', {reason});
+      this.removeAllListeners();
+    });
   }
 
   @throwIfDisposed((session: Session) => {
-    return `Session (${session.id}) has already ended.`;
+    // SAFETY: By definition of `disposed`, `#reason` is defined.
+    return session.#reason!;
   })
   async end(): Promise<void> {
     await this.connection.send('session.end', {});
-    this.#ended = true;
-    this.emit('ended', undefined);
+    this.#reason = `Session (${this.id}) has already ended.`;
+    this.emit('ended', {reason: this.#reason});
+    this.removeAllListeners();
   }
 }

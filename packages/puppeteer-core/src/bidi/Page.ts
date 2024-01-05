@@ -47,8 +47,7 @@ import {DisposableStack} from '../util/disposable.js';
 
 import type {BidiBrowser} from './Browser.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
-import type {BrowsingContext} from './BrowsingContext.js';
-import type {BidiConnection} from './Connection.js';
+import type {BrowsingContext} from './core/BrowsingContext.js';
 import {EmulationManager} from './EmulationManager.js';
 import {BidiFrame} from './Frame.js';
 import type {BidiHTTPResponse} from './HTTPResponse.js';
@@ -61,7 +60,13 @@ import type {BiDiPageTarget} from './Target.js';
  * @internal
  */
 export class BidiPage extends Page {
-  #frame: BidiFrame;
+  static async create(context: BrowsingContext): Promise<BidiPage> {
+    const page = new BidiPage(context);
+    await page.#initialize();
+    return page;
+  }
+
+  #context: BrowsingContext;
 
   #accessibility: Accessibility;
   #cdpEmulationManager: CdpEmulationManager;
@@ -77,11 +82,7 @@ export class BidiPage extends Page {
 
   constructor(context: BrowsingContext) {
     super();
-    this.#frame = BidiFrame.createRootFrame(
-      this,
-      context,
-      this._timeoutSettings
-    );
+    this.#context = context;
 
     // TODO: https://github.com/w3c/webdriver-bidi/issues/443
     this.#accessibility = new Accessibility(context.cdpSession);
@@ -109,8 +110,8 @@ export class BidiPage extends Page {
     );
   }
 
-  get #connection(): BidiConnection {
-    return this.browser().connection;
+  get #frame(): BidiFrame {
+    return BidiFrame.create(this, this.#context, this._timeoutSettings);
   }
 
   override get accessibility(): Accessibility {
@@ -137,6 +138,15 @@ export class BidiPage extends Page {
     return this.#keyboard;
   }
 
+  async #initialize(): Promise<void> {
+    this.#context.on('destroyed', ({context}) => {
+      if (context === this.#context) {
+        this.emit(PageEvent.Close, undefined);
+        this.removeAllListeners();
+      }
+    });
+  }
+
   _client(): CDPSession {
     return this.#frame.client;
   }
@@ -158,7 +168,11 @@ export class BidiPage extends Page {
   }
 
   override frames(): BidiFrame[] {
-    return [...this.#frame.getDescendants()];
+    const frames = [this.#frame];
+    for (const child of frames) {
+      frames.push(...child.childFrames());
+    }
+    return frames;
   }
 
   override isClosed(): boolean {
@@ -327,10 +341,6 @@ export class BidiPage extends Page {
     timeout?: number;
   }): Promise<void> {
     return await this.#frame.waitForNetworkIdle(options);
-  }
-
-  override async createCDPSession(): Promise<CDPSession> {
-    return await this.#frame.createCDPSession();
   }
 
   override async bringToFront(): Promise<void> {

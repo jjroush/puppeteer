@@ -15,20 +15,47 @@ export type CreateBrowsingContextOptions = Omit<
 };
 
 export class UserContext extends EventEmitter<{
-  context: BrowsingContext;
+  /**
+   * Emitted when a new browsing context is created.
+   */
+  context: {context: BrowsingContext};
 }> {
+  static create(browser: Browser, id: string): UserContext {
+    const context = new UserContext(browser, id);
+    void context.#initialize();
+    return context;
+  }
+
   readonly browser: Browser;
+  readonly id: string;
 
   readonly #disposables = new DisposableStack();
+  // Note these are only top-level contexts.
   readonly #contexts = new Map<string, Deferred<BrowsingContext>>();
 
-  constructor(browser: Browser) {
+  constructor(browser: Browser, id: string) {
     super();
+    this.id = id;
     this.browser = browser;
+  }
 
+  get #connection() {
+    return this.browser.session.connection;
+  }
+
+  get contexts(): AsyncIterable<BrowsingContext> {
+    return async function* (this: UserContext) {
+      for (const context of this.#contexts.values()) {
+        yield await context.valueOrThrow();
+      }
+    }.call(this);
+  }
+
+  async #initialize() {
+    const connection = this.#connection;
     this.#disposables.use(
       new EventSubscription(
-        this.#connection,
+        connection,
         'browsingContext.contextCreated',
         (info: Bidi.BrowsingContext.Info) => {
           if (info.parent) {
@@ -39,15 +66,10 @@ export class UserContext extends EventEmitter<{
           const deferred = this.#contexts.get(context.id) ?? new Deferred();
           deferred.resolve(context);
           this.#contexts.set(context.id, deferred);
-
-          this.emit('context', context);
+          this.emit('context', {context});
         }
       )
     );
-  }
-
-  get #connection() {
-    return this.browser.session.connection;
   }
 
   async createBrowsingContext(
@@ -62,9 +84,16 @@ export class UserContext extends EventEmitter<{
       referenceContext: options.referenceContext?.id,
     });
 
-    const context = this.#contexts.get(contextId) ?? new Deferred();
-    this.#contexts.set(contextId, context);
+    const deferred = this.#contexts.get(contextId) ?? new Deferred();
+    this.#contexts.set(contextId, deferred);
 
-    return await context.valueOrThrow();
+    return await deferred.valueOrThrow();
+  }
+
+  async close(): Promise<void> {
+    for (const deferred of this.#contexts.values()) {
+      const context = await deferred.valueOrThrow();
+      await context.close();
+    }
   }
 }

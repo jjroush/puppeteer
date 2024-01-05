@@ -114,6 +114,29 @@ export function invokeAtMostOnceForArguments(
   };
 }
 
+export function cached<
+  This,
+  Args extends unknown[],
+  Key,
+  Ret extends NonNullable<unknown>,
+>(getKey: (...args: Args) => Key) {
+  return (
+    target: (this: This, ...args: Args) => Ret,
+    _: unknown
+  ): typeof target => {
+    const cache = new Map<Key, Ret>();
+    return function (this: This, ...args: Args) {
+      const key = getKey(...args);
+      let ret = cache.get(key);
+      if (ret === undefined) {
+        ret = target.call(this, ...args);
+        cache.set(key, ret);
+      }
+      return ret;
+    };
+  };
+}
+
 export function guarded<T extends object>(
   getKey = function (this: T): object {
     return this;

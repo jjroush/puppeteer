@@ -75,8 +75,8 @@ export class Navigation extends EventEmitter<{
     return this.#url;
   }
 
-  async request(): Promise<BidiRequest | undefined> {
-    const id = await this.#id.valueOrThrow();
+  request(): BidiRequest | undefined {
+    const id = this.#id.value() as string | undefined;
     for (const request of this.#context.requests) {
       if (request.navigation === id) {
         return request;

@@ -34,10 +34,10 @@ export type HandleUserPromptOptions = Omit<
  */
 export class BrowsingContext extends EventEmitter<{
   // Emitted when a child context is created.
-  created: BrowsingContext;
+  created: {context: BrowsingContext};
   // Emitted when a child context or itself is destroyed.
-  destroyed: BrowsingContext;
-  // Emitted whenever the navigation occurs.
+  destroyed: {context: BrowsingContext};
+  // Emitted whenever a navigation occurs on itself.
   navigation: Navigation;
   // Emitted whenever a request is made.
   request: BidiRequest;
@@ -73,7 +73,6 @@ export class BrowsingContext extends EventEmitter<{
     url: string
   ) {
     super();
-
     this.context = context;
     this.parent = parent;
     this.id = id;
@@ -95,18 +94,18 @@ export class BrowsingContext extends EventEmitter<{
             info.url
           );
           this.#children.set(info.context, context);
-          this.emit('created', context);
+          this.emit('created', {context: context});
 
           this.#disposables.use(
             new EventSubscription(
               context,
               'destroyed',
-              (destroyedContext: BrowsingContext) => {
+              ({context: destroyedContext}) => {
                 if (destroyedContext !== context) {
                   return;
                 }
-                this.#children.delete(context.id);
-                this.emit('destroyed', context);
+                this.#children.delete(destroyedContext.id);
+                this.emit('destroyed', {context: destroyedContext});
               }
             )
           );
@@ -122,11 +121,12 @@ export class BrowsingContext extends EventEmitter<{
             return;
           }
           this.#disposables.dispose();
-          this.emit('destroyed', this);
+          this.emit('destroyed', {context: this});
           this.removeAllListeners();
         }
       )
     );
+
     this.#disposables.use(
       new EventSubscription(
         connection,

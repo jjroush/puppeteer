@@ -19,7 +19,7 @@ import type Protocol from 'devtools-protocol';
 import type {Frame} from '../api/Frame.js';
 import {HTTPResponse, type RemoteAddress} from '../api/HTTPResponse.js';
 import {UnsupportedOperation} from '../common/Errors.js';
-import {invokeAtMostOnceForArguments} from '../util/decorators.js';
+import {cached, invokeAtMostOnceForArguments} from '../util/decorators.js';
 
 import type {BidiHTTPRequest} from './HTTPRequest.js';
 
@@ -27,6 +27,18 @@ import type {BidiHTTPRequest} from './HTTPRequest.js';
  * @internal
  */
 export class BidiHTTPResponse extends HTTPResponse {
+  @cached((_, data) => {
+    return data;
+  })
+  static create(
+    request: BidiHTTPRequest,
+    data: Bidi.Network.ResponseData
+  ): BidiHTTPResponse {
+    const response = new BidiHTTPResponse(request, data);
+    void response.#initialize();
+    return response;
+  }
+
   #request: BidiHTTPRequest;
   #data: Bidi.Network.ResponseData;
 
@@ -35,6 +47,8 @@ export class BidiHTTPResponse extends HTTPResponse {
     this.#request = request;
     this.#data = data;
   }
+
+  async #initialize(): Promise<void> {}
 
   @invokeAtMostOnceForArguments
   override remoteAddress(): RemoteAddress {

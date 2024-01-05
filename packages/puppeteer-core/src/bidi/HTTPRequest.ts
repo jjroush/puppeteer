@@ -15,74 +15,56 @@
  */
 import type * as Bidi from 'chromium-bidi/lib/cjs/protocol/protocol.js';
 
-import {FrameEvent, type Frame} from '../api/Frame.js';
+import type {CDPSession} from '../api/CDPSession.js';
 import type {
   ContinueRequestOverrides,
   ResponseForRequest,
 } from '../api/HTTPRequest.js';
 import {HTTPRequest, type ResourceType} from '../api/HTTPRequest.js';
-import {PageEvent} from '../api/Page.js';
 import {UnsupportedOperation} from '../common/Errors.js';
-import {invokeAtMostOnceForArguments} from '../util/decorators.js';
+import {cached, invokeAtMostOnceForArguments} from '../util/decorators.js';
 
+import type {BidiRequest} from './core/Request.js';
 import type {BidiFrame} from './Frame.js';
 import {BidiHTTPResponse} from './HTTPResponse.js';
-import type {BidiRequest} from './core/Request.js';
 
 /**
  * @internal
  */
 export class BidiHTTPRequest extends HTTPRequest {
+  @cached((_, request) => {
+    return request;
+  })
+  static create(
+    frame: BidiFrame | undefined,
+    bidiRequest: BidiRequest
+  ): BidiHTTPRequest {
+    const request = new BidiHTTPRequest(frame, bidiRequest);
+    void request.#initialize();
+    return request;
+  }
+
   #frame: BidiFrame | undefined;
   #request: BidiRequest;
 
-  #response?: BidiHTTPResponse;
-  #failure?: {errorText: string};
-
   constructor(frame: BidiFrame | undefined, request: BidiRequest) {
     super();
-
     this.#frame = frame;
     this.#request = request;
-
-    this.#request
-      .response()
-      .valueOrThrow()
-      .then(
-        response => {
-          this.#response = new BidiHTTPResponse(this, response);
-          if (!this.#frame) {
-            return;
-          }
-
-          this.#frame.bubbleEmit(FrameEvent.Response, this.#response);
-          this.#frame.page().emit(PageEvent.Response, this.#response);
-
-          this.#frame.bubbleEmit(FrameEvent.RequestFinished, this);
-          this.#frame.page().emit(PageEvent.RequestFinished, this);
-        },
-        error => {
-          this.#failure = {errorText: error.message};
-          if (!this.#frame) {
-            return;
-          }
-
-          this.#frame.bubbleEmit(FrameEvent.RequestFailed, this);
-          this.#frame.page().emit(PageEvent.RequestFailed, this);
-        }
-      );
   }
 
-  override get client(): never {
-    throw new UnsupportedOperation();
+  override get client(): CDPSession {
+    throw new Error('Method not implemented.');
   }
+
+  async #initialize(): Promise<void> {}
 
   override url(): string {
     return this.#request.url;
   }
 
   override resourceType(): ResourceType {
-    return this.initiator().type.toLowerCase() as ResourceType;
+    return this.initiator().type as ResourceType;
   }
 
   override method(): string {
@@ -103,11 +85,17 @@ export class BidiHTTPRequest extends HTTPRequest {
   }
 
   override response(): BidiHTTPResponse | null {
-    return this.#response ?? null;
+    if (this.#request.response === undefined) {
+      return null;
+    }
+    return BidiHTTPResponse.create(this, this.#request.response);
   }
 
   override failure(): {errorText: string} | null {
-    return this.#failure ?? null;
+    if (this.#request.error === undefined) {
+      return null;
+    }
+    return {errorText: this.#request.error};
   }
 
   override isNavigationRequest(): boolean {
@@ -119,8 +107,21 @@ export class BidiHTTPRequest extends HTTPRequest {
   }
 
   override redirectChain(): BidiHTTPRequest[] {
-    // TODO: Implement redirect.
-    return [];
+    if (this.#request.redirect === undefined) {
+      return [];
+    }
+
+    const redirects = [
+      BidiHTTPRequest.create(this.#frame, this.#request.redirect),
+    ];
+    for (const request of redirects) {
+      if (request.#request.redirect !== undefined) {
+        redirects.push(
+          BidiHTTPRequest.create(this.#frame, request.#request.redirect)
+        );
+      }
+    }
+    return redirects;
   }
 
   override enqueueInterceptAction(
@@ -130,7 +131,7 @@ export class BidiHTTPRequest extends HTTPRequest {
     void pendingHandler();
   }
 
-  override frame(): Frame | null {
+  override frame(): BidiFrame | null {
     return this.#frame ?? null;
   }
 

@@ -20,68 +20,55 @@ import {
   bufferCount,
   concat,
   debounceTime,
+  filter,
   filterAsync,
   firstValueFrom,
   from,
-  fromEvent,
   map,
   merge,
+  mergeMap,
   of,
   raceWith,
   switchMap,
   zip,
 } from '../../third_party/rxjs/rxjs.js';
-import type {CDPSession} from '../api/CDPSession.js';
 import type {BoundingBox, ElementHandle} from '../api/ElementHandle.js';
-import type {FrameEvents} from '../api/Frame.js';
 import {
   Frame,
-  FrameEvent,
   throwIfDetached,
   type GoToOptions,
   type WaitForOptions,
 } from '../api/Frame.js';
 import type {HTTPRequest} from '../api/HTTPRequest.js';
 import type {HTTPResponse} from '../api/HTTPResponse.js';
-import type {
-  AwaitablePredicate,
-  ScreenshotOptions,
-  WaitTimeoutOptions,
+import {
+  PageEvent,
+  type AwaitablePredicate,
+  type ScreenshotOptions,
+  type WaitForSelectorOptions,
+  type WaitTimeoutOptions,
 } from '../api/Page.js';
-import {PageEvent, type WaitForSelectorOptions} from '../api/Page.js';
-import type {
-  ConsoleMessageLocation,
-  ConsoleMessageType,
-} from '../common/ConsoleMessage.js';
-import {ConsoleMessage} from '../common/ConsoleMessage.js';
+import type {ConsoleMessageLocation} from '../common/ConsoleMessage.js';
 import {UnsupportedOperation} from '../common/Errors.js';
-import {EventSubscription} from '../common/EventEmitter.js';
 import type {PDFOptions} from '../common/PDFOptions.js';
 import type {TimeoutSettings} from '../common/TimeoutSettings.js';
 import type {Awaitable, NodeFor} from '../common/types.js';
 import {
-  NETWORK_IDLE_TIME,
-  debugError,
   fromEmitterEvent,
   importFSPromises,
+  NETWORK_IDLE_TIME,
   parsePDFOptions,
   timeout,
 } from '../common/util.js';
-import {DisposableStack} from '../util/disposable.js';
+import {cached} from '../util/decorators.js';
 
-import {BidiCdpSession} from './BidiCdpSession.js';
 import type {BidiBrowserContext} from './BrowserContext.js';
-import type {BrowsingContext} from './BrowsingContext.js';
-import {BidiDeserializer} from './Deserializer.js';
-import type {UserPrompt} from './core/UserPrompt.js';
+import type {BrowsingContext} from './core/BrowsingContext.js';
 import {BidiElementHandle} from './ElementHandle.js';
 import {ExposeableFunction} from './ExposedFunction.js';
 import {BidiHTTPRequest} from './HTTPRequest.js';
-import type {BidiHTTPResponse} from './HTTPResponse.js';
-import type {Navigation} from './core/Navigation.js';
+import {BidiHTTPResponse} from './HTTPResponse.js';
 import type {BidiPage} from './Page.js';
-import {createBidiHandle} from './Realm.js';
-import type {BidiRequest} from './core/Request.js';
 import type {Sandbox} from './Sandbox.js';
 
 /**
@@ -89,191 +76,47 @@ import type {Sandbox} from './Sandbox.js';
  * @internal
  */
 export class BidiFrame extends Frame {
-  static createRootFrame(
+  @cached((_, context, ___) => {
+    return context;
+  })
+  static create(
     page: BidiPage,
     context: BrowsingContext,
     timeoutSettings: TimeoutSettings
   ): BidiFrame {
-    return new BidiFrame(page, undefined, context, timeoutSettings);
-  }
-
-  static #rootOnly<T extends unknown[], R>(
-    target: (this: BidiFrame, ...args: T) => R,
-    _: unknown
-  ): (this: BidiFrame, ...args: T) => R {
-    return function (this: BidiFrame, ...args: T) {
-      if (this.#parent) {
-        throw new Error(`Can only call ${target.name} on top-level frames.`);
-      }
-      return target.call(this, ...args);
-    };
+    const frame = new BidiFrame(page, context, timeoutSettings);
+    void frame.#initialize();
+    return frame;
   }
 
   readonly #page: BidiPage;
-  readonly #parent: BidiFrame | undefined;
   readonly #context: BrowsingContext;
   readonly #timeoutSettings: TimeoutSettings;
 
-  readonly #children = new Map<string, BidiFrame>();
-  // A map of ongoing requests.
-  readonly #requests = new Map<string, BidiHTTPRequest>();
-  readonly #disposables = new DisposableStack();
+  readonly destroyed$: Observable<never>;
 
   private constructor(
     page: BidiPage,
-    parent: BidiFrame | undefined,
     context: BrowsingContext,
     timeoutSettings: TimeoutSettings
   ) {
     super();
     this.#page = page;
-    this.#parent = parent;
     this.#context = context;
     this.#timeoutSettings = timeoutSettings;
 
-    this.#disposables.use(
-      new EventSubscription(
-        this.#context,
-        'created',
-        (context: BrowsingContext) => {
-          const frame = new BidiFrame(
-            this.#page,
-            this,
-            context,
-            this.#timeoutSettings
-          );
-          this.#children.set(context.id, frame);
-          this.#page.emit(PageEvent.FrameAttached, frame);
-
-          this.#disposables.use(
-            new EventSubscription(
-              context,
-              'destroyed',
-              (destroyedContext: BrowsingContext) => {
-                if (destroyedContext !== context) {
-                  return;
-                }
-                this.#children.delete(context.id);
-              }
-            )
-          );
-        }
-      )
-    );
-
-    this.#disposables.use(
-      new EventSubscription(
-        this.#context,
-        'destroyed',
-        (context: BrowsingContext) => {
-          if (context !== this.#context) {
-            return;
-          }
-          this.#disposables.dispose();
-          this.emit(FrameEvent.FrameDetached, this);
-          this.#page.emit(PageEvent.FrameDetached, this);
-          this.removeAllListeners();
-        }
-      )
-    );
-
-    this.#disposables.use(
-      new EventSubscription(
-        this.#context,
-        'request',
-        (request: BidiRequest) => {
-          const httpRequest = new BidiHTTPRequest(this, request);
-          this.#requests.set(request.id, httpRequest);
-
-          this.bubbleEmit(FrameEvent.Request, httpRequest);
-          this.#page.emit(PageEvent.Request, httpRequest);
-        }
-      )
-    );
-
-    this.#disposables.use(
-      new EventSubscription(
-        this.#context,
-        'navigation',
-        (navigation: Navigation) => {
-          navigation.once('dom', () => {
-            this.#page.emit(PageEvent.DOMContentLoaded, undefined);
-            this.#page.emit(PageEvent.FrameNavigated, this);
-          });
-          navigation.once('loaded', () => {
-            this.#page.emit(PageEvent.Load, undefined);
-          });
-        }
-      )
-    );
-
-    this.#disposables.use(
-      new EventSubscription(this.#context, 'dialog', (dialog: UserPrompt) => {
-        this.#page.emit(PageEvent.Dialog, dialog);
-      })
-    );
-
-    this.#disposables.use(
-      new EventSubscription(this.#context, 'log', (event: Bidi.Log.Entry) => {
-        if (isConsoleLogEntry(event)) {
-          const args = event.args.map(arg => {
-            return createBidiHandle(this.mainRealm(), arg);
-          });
-
-          const text = args
-            .reduce((value, arg) => {
-              const parsedValue = arg.isPrimitiveValue
-                ? BidiDeserializer.deserialize(arg.remoteValue())
-                : arg.toString();
-              return `${value} ${parsedValue}`;
-            }, '')
-            .slice(1);
-
-          this.#page.emit(
-            PageEvent.Console,
-            new ConsoleMessage(
-              event.method as ConsoleMessageType,
-              text,
-              args,
-              getStackTraceLocations(event.stackTrace)
-            )
-          );
-        } else if (isJavaScriptLogEntry(event)) {
-          const error = new Error(event.text ?? '');
-
-          const messageHeight = error.message.split('\n').length;
-          const messageLines = error
-            .stack!.split('\n')
-            .splice(0, messageHeight);
-
-          const stackLines = [];
-          if (event.stackTrace) {
-            for (const frame of event.stackTrace.callFrames) {
-              // Note we need to add `1` because the values are 0-indexed.
-              stackLines.push(
-                `    at ${frame.functionName || '<anonymous>'} (${frame.url}:${
-                  frame.lineNumber + 1
-                }:${frame.columnNumber + 1})`
-              );
-              if (stackLines.length >= Error.stackTraceLimit) {
-                break;
-              }
-            }
-          }
-
-          error.stack = [...messageLines, ...stackLines].join('\n');
-          this.#page.emit(PageEvent.PageError, error);
-        } else {
-          debugError(
-            `Unhandled LogEntry with type "${event.type}", text "${event.text}" and level "${event.level}"`
-          );
-        }
+    this.destroyed$ = fromEmitterEvent(this.#context, 'destroyed').pipe(
+      filter(({context}) => {
+        return context === this.#context;
+      }),
+      map(() => {
+        throw new Error('Frame detached.');
       })
     );
   }
 
   get browserContext(): BidiBrowserContext {
-    return this.#context.browserContext;
+    return this.#page.browserContext();
   }
 
   override get detached(): boolean {
@@ -284,42 +127,44 @@ export class BidiFrame extends Frame {
     return this.#context.id;
   }
 
-  override get client(): CDPSession {
-    return this.#context.cdpSession;
-  }
-
-  bubbleEmit<FrameEvent extends keyof FrameEvents>(
-    event: FrameEvent,
-    data: FrameEvents[FrameEvent]
-  ): void {
-    this.emit(event, data);
-    if (this.#parent) {
-      this.#parent.bubbleEmit(event, data);
-    }
-  }
-
-  *getDescendants(): Iterable<BidiFrame> {
-    const frames: BidiFrame[] = [this];
-    for (let frame = frames.shift(); frame; frame = frames.shift()) {
-      yield frame;
-      frames.push(...frame.childFrames());
-    }
-  }
-
-  @throwIfDetached
-  async createCDPSession(): Promise<CDPSession> {
-    const {sessionId} = await this.#context.cdpSession.send(
-      'Target.attachToTarget',
-      {
-        targetId: this._id,
-        flatten: true,
+  async #initialize(): Promise<void> {
+    this.#context.on('request', request => {
+      const httpRequest = BidiHTTPRequest.create(this, request);
+      this.page().emit(PageEvent.Request, httpRequest);
+      request.once('success', data => {
+        this.page().emit(
+          PageEvent.Response,
+          BidiHTTPResponse.create(httpRequest, data)
+        );
+        this.page().emit(PageEvent.RequestFinished, httpRequest);
+      });
+      request.once('error', () => {
+        this.page().emit(PageEvent.RequestFailed, httpRequest);
+      });
+    });
+    this.#context.on('created', ({context}) => {
+      this.page().emit(
+        PageEvent.FrameAttached,
+        BidiFrame.create(this.page(), context, this.#timeoutSettings)
+      );
+    });
+    this.#context.on('destroyed', ({context}) => {
+      if (context === this.#context) {
+        this.page().emit(PageEvent.FrameDetached, this);
       }
-    );
-    return new BidiCdpSession(this.#context, sessionId);
+    });
+    this.#context.on('navigation', navigation => {
+      this.page().emit(PageEvent.FrameNavigated, this);
+      navigation.once('loaded', () => {
+        this.page().emit(PageEvent.Load, undefined);
+      });
+      navigation.once('dom', () => {
+        this.page().emit(PageEvent.DOMContentLoaded, undefined);
+      });
+    });
   }
 
   @throwIfDetached
-  @BidiFrame.#rootOnly
   async bringToFront(): Promise<void> {
     await this.#context.activate();
   }
@@ -331,13 +176,11 @@ export class BidiFrame extends Frame {
   }
 
   @throwIfDetached
-  @BidiFrame.#rootOnly
   async close(options?: {runBeforeUnload?: boolean}): Promise<void> {
     await this.#context.close(options?.runBeforeUnload ?? false);
   }
 
   @throwIfDetached
-  @BidiFrame.#rootOnly
   async pdf(options: PDFOptions = {}): Promise<Buffer> {
     const {path = undefined, timeout: ms = this.#timeoutSettings.timeout()} =
       options;
@@ -485,23 +328,23 @@ export class BidiFrame extends Frame {
       };
     }
 
-    const request$ = merge(
-      fromEmitterEvent(this, FrameEvent.Request),
-      fromEmitterEvent(this, FrameEvent.RequestFailed),
-      fromEmitterEvent(this, FrameEvent.RequestFinished)
-    ).pipe(filterAsync(urlOrPredicate));
-
     return await firstValueFrom(
-      request$.pipe(
-        raceWith(
-          timeout(ms),
-          fromEmitterEvent(this, FrameEvent.FrameDetached).pipe(
-            map(() => {
-              throw new Error('Page closed.');
-            })
-          )
+      fromEmitterEvent(this.#context, 'request')
+        .pipe(
+          mergeMap(request => {
+            return merge(
+              of(request),
+              fromEmitterEvent(request, 'success'),
+              fromEmitterEvent(request, 'error')
+            ).pipe(
+              map(() => {
+                return BidiHTTPRequest.create(this, request);
+              })
+            );
+          }),
+          filterAsync(urlOrPredicate)
         )
-      )
+        .pipe(raceWith(timeout(ms), this.destroyed$))
     );
   }
 
@@ -519,51 +362,120 @@ export class BidiFrame extends Frame {
       };
     }
 
-    const request$ = fromEmitterEvent(this, FrameEvent.Response).pipe(
-      filterAsync(urlOrPredicate)
-    );
-
     return await firstValueFrom(
-      request$.pipe(
-        raceWith(
-          timeout(ms),
-          fromEmitterEvent(this, FrameEvent.FrameDetached).pipe(
-            map(() => {
-              throw new Error('Page closed.');
-            })
-          )
+      fromEmitterEvent(this.#context, 'request')
+        .pipe(
+          mergeMap(request => {
+            const httpRequest = BidiHTTPRequest.create(this, request);
+            return fromEmitterEvent(request, 'success').pipe(
+              map(data => {
+                return BidiHTTPResponse.create(httpRequest, data);
+              })
+            );
+          }),
+          filterAsync(urlOrPredicate)
         )
-      )
+        .pipe(raceWith(timeout(ms), this.destroyed$))
     );
   }
 
   @throwIfDetached
   async waitForNetworkIdle(
-    options: {idleTime?: number; timeout?: number} = {}
+    options: {idleTime?: number; timeout?: number; count?: number} = {}
   ): Promise<void> {
     const {
       idleTime = NETWORK_IDLE_TIME,
       timeout: ms = this.#timeoutSettings.timeout(),
+      count = 0,
     } = options;
 
-    const idle$ = merge(
-      of(null),
-      fromEmitterEvent(this, PageEvent.Request),
-      fromEmitterEvent(this, PageEvent.RequestFinished),
-      fromEmitterEvent(this, PageEvent.RequestFailed),
-      fromEmitterEvent(this, PageEvent.Response)
-    ).pipe(debounceTime(idleTime));
+    if (count === Infinity) {
+      return;
+    }
 
     await firstValueFrom(
-      idle$.pipe(
-        raceWith(
-          timeout(ms),
-          fromEvent(this, PageEvent.Close).pipe(
-            map(() => {
-              throw new Error('Page closed.');
-            })
-          )
+      concat(
+        of(null),
+        fromEmitterEvent(this.#context, 'request').pipe(
+          mergeMap(request => {
+            return merge(
+              of(request),
+              fromEmitterEvent(request, 'success'),
+              fromEmitterEvent(request, 'error'),
+              fromEmitterEvent(request, 'redirect')
+            );
+          }),
+          bufferCount(count + 1, 1)
         )
+      ).pipe(debounceTime(idleTime), raceWith(timeout(ms), this.destroyed$))
+    );
+  }
+
+  @throwIfDetached
+  override async waitForNavigation(
+    options: WaitForOptions = {}
+  ): Promise<BidiHTTPResponse | null> {
+    let {waitUntil = 'load'} = options;
+    const {timeout: ms = this.#timeoutSettings.navigationTimeout()} = options;
+
+    if (!Array.isArray(waitUntil)) {
+      waitUntil = [waitUntil];
+    }
+
+    let bidiEvent: 'loaded' | 'dom' | undefined;
+    let requestCount = Infinity;
+    for (const event of waitUntil) {
+      switch (event) {
+        case 'load': {
+          bidiEvent = 'loaded';
+          break;
+        }
+        case 'domcontentloaded': {
+          bidiEvent = 'dom';
+          break;
+        }
+        case 'networkidle0': {
+          requestCount = 0;
+          break;
+        }
+        case 'networkidle2': {
+          requestCount = 2;
+          break;
+        }
+      }
+    }
+
+    return await firstValueFrom(
+      zip(
+        fromEmitterEvent(this.#context, 'navigation').pipe(
+          switchMap(navigation => {
+            if (bidiEvent !== undefined) {
+              return fromEmitterEvent(navigation, bidiEvent).pipe(
+                map(() => {
+                  return navigation;
+                })
+              );
+            } else {
+              return of(navigation);
+            }
+          })
+        ),
+        from(
+          this.waitForNetworkIdle({
+            idleTime: 500,
+            timeout: ms,
+            count: requestCount,
+          })
+        )
+      ).pipe(
+        map(([navigation]) => {
+          const request = navigation.request();
+          if (!request) {
+            return null;
+          }
+          return BidiHTTPRequest.create(this, request).response();
+        }),
+        raceWith(timeout(ms), this.destroyed$)
       )
     );
   }
@@ -598,11 +510,19 @@ export class BidiFrame extends Frame {
   }
 
   override parentFrame(): BidiFrame | null {
-    return this.#parent ?? null;
+    return this.#context.parent
+      ? BidiFrame.create(
+          this.#page,
+          this.#context.parent,
+          this.#timeoutSettings
+        )
+      : null;
   }
 
   override childFrames(): BidiFrame[] {
-    return [...this.#children.values()];
+    return [...this.#context.children].map(child => {
+      return BidiFrame.create(this.#page, child, this.#timeoutSettings);
+    });
   }
 
   @throwIfDetached
@@ -621,88 +541,6 @@ export class BidiFrame extends Frame {
   ): Promise<void> {
     void this.setFrameContent(html);
     await this.waitForNavigation(options);
-  }
-
-  @throwIfDetached
-  override async waitForNavigation(
-    options: WaitForOptions = {}
-  ): Promise<BidiHTTPResponse | null> {
-    let {waitUntil = 'load'} = options;
-    const {timeout: ms = this.#timeoutSettings.navigationTimeout()} = options;
-
-    if (!Array.isArray(waitUntil)) {
-      waitUntil = [waitUntil];
-    }
-
-    let bidiEvent: 'load' | 'dom' | undefined;
-    let requestCount = Infinity;
-    for (const event of waitUntil) {
-      switch (event) {
-        case 'load': {
-          bidiEvent = 'load';
-          break;
-        }
-        case 'domcontentloaded': {
-          bidiEvent = 'dom';
-          break;
-        }
-        case 'networkidle0': {
-          requestCount = 0;
-          break;
-        }
-        case 'networkidle2': {
-          requestCount = 2;
-          break;
-        }
-      }
-    }
-
-    const idle$ = concat(
-      of(null),
-      (fromEvent(this.#context, 'request') as Observable<BidiRequest>).pipe(
-        bufferCount(requestCount + 1, 1)
-      )
-    ).pipe(debounceTime(500));
-
-    const navigation$ = (
-      fromEvent(this.#context, 'navigation') as Observable<Navigation>
-    ).pipe(
-      switchMap(navigation => {
-        if (bidiEvent !== undefined) {
-          return fromEvent(navigation, bidiEvent).pipe(
-            map(() => {
-              return navigation;
-            })
-          );
-        } else {
-          return of(navigation);
-        }
-      })
-    );
-
-    const navigation = await firstValueFrom(
-      zip(navigation$, idle$).pipe(
-        map(([navigation]) => {
-          return navigation;
-        }),
-        raceWith(
-          timeout(ms),
-          fromEmitterEvent(this, FrameEvent.FrameDetached).pipe(
-            map(() => {
-              throw new Error('Frame detached.');
-            })
-          )
-        )
-      )
-    );
-
-    // By now, the request should have come in if any.
-    const bidiRequest = await navigation.request();
-    if (!bidiRequest) {
-      return null;
-    }
-    const request = new BidiHTTPRequest(this, bidiRequest);
-    return request.response();
   }
 
   override waitForDevicePrompt(): never {

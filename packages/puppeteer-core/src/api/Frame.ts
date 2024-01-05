@@ -46,14 +46,14 @@ import {assert} from '../util/assert.js';
 import {throwIfDisposed} from '../util/decorators.js';
 
 import type {CDPSession} from './CDPSession.js';
+import type {HTTPRequest} from './HTTPRequest.js';
 import type {KeyboardTypeOptions} from './Input.js';
 import {
   FunctionLocator,
-  type Locator,
   NodeLocator,
+  type Locator,
 } from './locators/locators.js';
 import type {Realm} from './Realm.js';
-import type {HTTPRequest} from './HTTPRequest.js';
 
 /**
  * @public
